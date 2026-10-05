@@ -174,6 +174,10 @@ func (m *Menu) addInstanceOptions() {
 			actionGroup = append(actionGroup, keys.KeyCheckout)
 		}
 	}
+	// Remote Control lets claude.ai/code and the Claude app continue a Claude Code session.
+	if m.instance.IsClaude() {
+		actionGroup = append(actionGroup, keys.KeyRemote)
+	}
 
 	// Navigation group
 	var navigationGroup []keys.KeyName

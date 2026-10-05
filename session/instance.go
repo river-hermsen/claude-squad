@@ -54,6 +54,9 @@ type Instance struct {
 	AutoYes bool
 	// Prompt is the initial prompt to pass to the instance on startup
 	Prompt string
+	// RemoteControl is true if the Claude Code session runs with Remote Control on, so that
+	// claude.ai/code and the Claude app can continue it; see remote_control.go.
+	RemoteControl bool
 
 	// DiffStats stores the current git diff statistics
 	diffStats *git.DiffStats
@@ -86,6 +89,22 @@ type Instance struct {
 	// adoptsClaudeName is true for an instance resuming a conversation picked in Claude Code,
 	// until it has taken that conversation's name as its title; see AdoptClaudeName.
 	adoptsClaudeName bool
+	// claudeSessionID is the conversation last seen running in the tmux pane. Restarting the
+	// instance after its tmux session ended continues it; see Resume.
+	claudeSessionID string
+	// resumedAt is when Resume last restarted the instance on claudeSessionID, or zero if it
+	// started it afresh; see MarkEnded.
+	resumedAt time.Time
+
+	// remoteSessionID is the claude.ai session Remote Control connects the running Claude Code
+	// session to, or "" while Remote Control is off; see SetClaudeProcess.
+	remoteSessionID string
+	// remoteSince is when Remote Control was last asked for, by starting the session with it or
+	// switching it on. RemoteState counts it as failed if it is still off well after.
+	remoteSince time.Time
+	// pendingRemoteControl is true while `/remote-control` waits for Claude Code to be idle;
+	// see SyncRemoteControl.
+	pendingRemoteControl bool
 }
 
 // ToInstanceData converts an Instance to its serializable form
@@ -102,6 +121,9 @@ func (i *Instance) ToInstanceData() InstanceData {
 		Program:   i.Program,
 		AutoYes:   i.AutoYes,
 		ClaudeDir: i.claudeDir,
+
+		RemoteControl:   i.RemoteControl,
+		ClaudeSessionID: i.claudeSessionID,
 	}
 
 	if i.workspace != nil {
@@ -137,6 +159,9 @@ func FromInstanceData(data InstanceData) (*Instance, error) {
 		CreatedAt: data.CreatedAt,
 		UpdatedAt: data.UpdatedAt,
 		Program:   data.Program,
+
+		RemoteControl:   data.RemoteControl,
+		claudeSessionID: data.ClaudeSessionID,
 	}
 
 	if data.Workspace != nil {
@@ -178,6 +203,8 @@ type InstanceOptions struct {
 	AutoYes bool
 	// Branch is an existing branch name to start the session on (empty = new branch from HEAD)
 	Branch string
+	// RemoteControl starts a Claude Code session with Remote Control on.
+	RemoteControl bool
 }
 
 func NewInstance(opts InstanceOptions) (*Instance, error) {
@@ -199,6 +226,7 @@ func NewInstance(opts InstanceOptions) (*Instance, error) {
 		CreatedAt:      t,
 		UpdatedAt:      t,
 		AutoYes:        false,
+		RemoteControl:  opts.RemoteControl,
 		selectedBranch: opts.Branch,
 	}, nil
 }
@@ -236,9 +264,14 @@ func IsClaudeProgram(program string) bool {
 }
 
 // launchProgram returns the command the tmux session runs: the program, plus for Claude Code
-// the session name, the settings writeClaudeSettings writes, the workspace's arguments and
-// launchArgs.
+// the session name, Remote Control, the settings writeClaudeSettings writes, the workspace's
+// arguments and launchArgs.
 func (i *Instance) launchProgram() string {
+	return i.programWith(i.launchArgs)
+}
+
+// programWith is launchProgram with args in place of launchArgs.
+func (i *Instance) programWith(args string) string {
 	program := i.Program
 	if i.claudeDir == "" {
 		return program
@@ -246,16 +279,30 @@ func (i *Instance) launchProgram() string {
 	if !i.adoptsClaudeName {
 		program += " --name " + shellQuote(i.Title)
 	}
+	if i.RemoteControl {
+		program += " --remote-control"
+	}
 	program += " " + claudestatus.Args(i.claudeDir)
 	if i.workspace != nil {
 		if args := i.workspace.ClaudeArgs(); args != "" {
 			program += " " + args
 		}
 	}
-	if i.launchArgs != "" {
-		program += " " + i.launchArgs
+	if args != "" {
+		program += " " + args
 	}
 	return program
+}
+
+// restartArgs returns the Claude Code arguments for restarting the instance after its tmux
+// session ended: --resume of the conversation it ran, if Claude Code saved it. Continuing the
+// conversation also reconnects its Remote Control session on claude.ai, so the same link
+// keeps working. Otherwise it is launchArgs, and resumed is false.
+func (i *Instance) restartArgs() (args string, resumed bool) {
+	if i.claudeDir != "" && claudestatus.HasTranscript(i.claudeSessionID) {
+		return "--resume " + shellQuote(i.claudeSessionID), true
+	}
+	return i.launchArgs, false
 }
 
 // setClaudeDir gives a new Claude instance its own directory for Claude Code settings.
@@ -529,6 +576,7 @@ func (i *Instance) Start(firstTimeSetup bool) error {
 		i.tmuxSession.SetProgram(i.launchProgram())
 	}
 
+	i.remoteSince = time.Now()
 	i.SetStatus(Running)
 
 	return nil
@@ -761,20 +809,36 @@ func (i *Instance) Resume() error {
 		if err := i.tmuxSession.Restore(); err != nil {
 			log.ErrorLog.Print(err)
 			// If restore fails, fall back to creating new session
-			if err := i.tmuxSession.Start(i.GetWorkDir()); err != nil {
+			if err := i.restart(); err != nil {
 				log.ErrorLog.Print(err)
 				return fmt.Errorf("failed to start new session: %w", err)
 			}
 		}
 	} else {
 		// Create new tmux session
-		if err := i.tmuxSession.Start(i.GetWorkDir()); err != nil {
+		if err := i.restart(); err != nil {
 			log.ErrorLog.Print(err)
 			return fmt.Errorf("failed to start new session: %w", err)
 		}
 	}
 
+	i.remoteSince = time.Now()
 	i.SetStatus(Running)
+	return nil
+}
+
+// restart starts a new tmux session for the instance, continuing its conversation if it can;
+// see restartArgs.
+func (i *Instance) restart() error {
+	args, resumed := i.restartArgs()
+	i.tmuxSession.SetProgram(i.programWith(args))
+	if err := i.tmuxSession.Start(i.GetWorkDir()); err != nil {
+		return err
+	}
+	i.resumedAt = time.Time{}
+	if resumed {
+		i.resumedAt = time.Now()
+	}
 	return nil
 }
 
@@ -835,10 +899,20 @@ func (i *Instance) ComputeClaudeInfo() *claudestatus.Info {
 // paneSessionID returns the id of the Claude Code conversation running in the instance's tmux
 // pane, or "" if it cannot tell.
 func (i *Instance) paneSessionID() string {
-	if i.tmuxSession == nil {
-		return ""
+	if p := i.ComputeClaudeProcess(); p != nil {
+		return p.SessionID
 	}
-	return claudestatus.SessionIDForPID(i.tmuxSession.PanePID())
+	return ""
+}
+
+// ComputeClaudeProcess reads Claude Code's registry entry of the process in the instance's
+// tmux pane, or returns nil if there is none or the program is not Claude Code. Safe to call
+// from a background goroutine.
+func (i *Instance) ComputeClaudeProcess() *claudestatus.Process {
+	if i.claudeDir == "" || i.tmuxSession == nil {
+		return nil
+	}
+	return claudestatus.ReadProcess(i.tmuxSession.PanePID())
 }
 
 // SetClaudeInfo sets what Claude Code last reported. Should be called from the main event

@@ -44,6 +44,8 @@ const (
 	KeyFocus
 	// KeyFocusExit is KeyFocus pressed again, while typing into a session; see KeyFocus.
 	KeyFocusExit
+	// KeyRemote shows the selected session's Remote Control link, or turns Remote Control on.
+	KeyRemote
 )
 
 // GlobalKeyStringsMap is a global, immutable map string to keybinding.
@@ -72,6 +74,7 @@ var GlobalKeyStringsMap = map[string]KeyName{
 	"f":          KeyFork,
 	"C":          KeyResumeClaude,
 	"`":          KeyFocus,
+	"w":          KeyRemote,
 }
 
 // GlobalkeyBindings is a global, immutable map of KeyName tot keybinding.
@@ -162,6 +165,10 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 	KeyFocus: key.NewBinding(
 		key.WithKeys("`"),
 		key.WithHelp("`", "type"),
+	),
+	KeyRemote: key.NewBinding(
+		key.WithKeys("w"),
+		key.WithHelp("w", "remote"),
 	),
 
 	// -- Special keybindings --

@@ -59,6 +59,8 @@ const (
 	stateInput
 	// stateFocus is the state when keys go to the selected session, shown in the preview.
 	stateFocus
+	// stateRemote is the state when remoteOverlay shows a session's Remote Control link.
+	stateRemote
 )
 
 type home struct {
@@ -116,6 +118,12 @@ type home struct {
 	// inputOverlay asks for a line of text in stateInput, which onInputSubmit then gets.
 	inputOverlay  *overlay.InputOverlay
 	onInputSubmit func(value string) tea.Cmd
+	// remoteOverlay shows remoteInstance's Remote Control link in stateRemote.
+	remoteOverlay  *overlay.RemoteControlOverlay
+	remoteInstance *session.Instance
+
+	// windowHeight is the terminal's height.
+	windowHeight int
 }
 
 func newHome(ctx context.Context, program string, autoYes bool) *home {
@@ -176,6 +184,7 @@ func newHome(ctx context.Context, program string, autoYes bool) *home {
 // updateHandleWindowSizeEvent sets the sizes of the components.
 // The components will try to render inside their bounds.
 func (m *home) updateHandleWindowSizeEvent(msg tea.WindowSizeMsg) {
+	m.windowHeight = msg.Height
 	// List takes 30% of width, preview takes 70%
 	listWidth := int(float32(msg.Width) * 0.3)
 	tabsWidth := msg.Width - listWidth
@@ -267,6 +276,8 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.limits != nil {
 			m.list.SetLimits(msg.limits)
 		}
+		var cmds []tea.Cmd
+		save := false
 		for _, r := range msg.results {
 			// Skip instances that were paused while metadata was being computed
 			if r.instance.Status == session.Paused {
@@ -276,8 +287,15 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// The program exited, taking its tmux session with it. Pause the instance, as
 				// for a session lost to a tmux restart, so it can be resumed or killed.
 				log.WarningLog.Printf("tmux session for %q ended; pausing instance so it can be resumed", r.instance.Title)
-				r.instance.SetStatus(session.Paused)
+				if err := r.instance.MarkEnded(); err != nil {
+					cmds = append(cmds, m.handleError(err))
+				}
+				save = true
 				continue
+			}
+			if r.instance.SetClaudeProcess(r.claudeProcess) {
+				// A restart continues this conversation, even after cs itself restarts.
+				save = true
 			}
 			if r.updated {
 				r.instance.SetStatus(session.Running)
@@ -285,9 +303,14 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				r.instance.TapEnter()
 			} else {
 				r.instance.SetStatus(session.Ready)
-				// A renamed Claude session takes its new name once it is idle.
-				if _, err := r.instance.SyncClaudeName(); err != nil {
+				// A renamed Claude session takes its new name once it is idle, and one that was
+				// asked to then turns on Remote Control, one command per tick.
+				if sent, err := r.instance.SyncClaudeName(); err != nil {
 					log.WarningLog.Printf("could not rename Claude session: %v", err)
+				} else if !sent {
+					if _, err := r.instance.SyncRemoteControl(); err != nil {
+						log.WarningLog.Printf("could not turn on Remote Control: %v", err)
+					}
 				}
 			}
 			if r.diffStats != nil && r.diffStats.Error != nil {
@@ -305,7 +328,13 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
-		return m, tickUpdateMetadataCmd(m.snapshotActiveInstances(), m.list.GetSelectedInstance())
+		if save {
+			if err := m.storage.SaveInstances(m.list.GetInstances()); err != nil {
+				log.ErrorLog.Printf("could not save instances: %v", err)
+			}
+		}
+		cmds = append(cmds, tickUpdateMetadataCmd(m.snapshotActiveInstances(), m.list.GetSelectedInstance()))
+		return m, tea.Batch(cmds...)
 	case tea.MouseMsg:
 		// Handle mouse wheel events for scrolling the diff/preview pane
 		if msg.Action == tea.MouseActionPress {
@@ -451,6 +480,8 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		return m.handleFocusKey(msg)
 	case stateInput:
 		return m.handleInputKey(msg)
+	case stateRemote:
+		return m.handleRemoteKey(msg)
 	}
 
 	cmd, returnEarly := m.handleMenuHighlighting(msg)
@@ -693,9 +724,10 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		}
 
 		instance, err := session.NewInstance(session.InstanceOptions{
-			Title:   "",
-			Path:    ".",
-			Program: m.program,
+			Title:         "",
+			Path:          ".",
+			Program:       m.program,
+			RemoteControl: m.appConfig.RemoteControlEnabled(),
 		})
 		if err != nil {
 			return m, m.handleError(err)
@@ -714,9 +746,10 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 				fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
 		}
 		instance, err := session.NewInstance(session.InstanceOptions{
-			Title:   "",
-			Path:    ".",
-			Program: m.program,
+			Title:         "",
+			Path:          ".",
+			Program:       m.program,
+			RemoteControl: m.appConfig.RemoteControlEnabled(),
 		})
 		if err != nil {
 			return m, m.handleError(err)
@@ -865,9 +898,10 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		// The instance is named after the conversation picked in Claude's picker; until
 		// then it has a placeholder name.
 		instance, err := session.NewInstance(session.InstanceOptions{
-			Title:   m.uniqueTitle("resume"),
-			Path:    ".",
-			Program: m.program,
+			Title:         m.uniqueTitle("resume"),
+			Path:          ".",
+			Program:       m.program,
+			RemoteControl: m.appConfig.RemoteControlEnabled(),
 		})
 		if err != nil {
 			return m, m.handleError(err)
@@ -897,6 +931,12 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		}
 		m.state = stateFocus
 		return m, m.instanceChanged()
+	case keys.KeyRemote:
+		selected := m.list.GetSelectedInstance()
+		if selected == nil || !selected.Started() || selected.Status == session.Loading {
+			return m, nil
+		}
+		return m, m.remoteControl(selected)
 	case keys.KeyResume:
 		selected := m.list.GetSelectedInstance()
 		if selected == nil || selected.Status == session.Loading {
@@ -1082,6 +1122,7 @@ func (m *home) forkInstance(src *session.Instance, title string) tea.Cmd {
 	if err != nil {
 		return m.handleError(err)
 	}
+	fork.RemoteControl = m.appConfig.RemoteControlEnabled()
 	m.list.AddInstance(fork)
 	m.list.SelectInstance(fork)
 	fork.SetStatus(session.Loading)
@@ -1188,6 +1229,8 @@ type instanceMetaResult struct {
 	hasPrompt  bool
 	diffStats  *git.DiffStats
 	claudeInfo *claudestatus.Info
+	// claudeProcess is Claude Code's registry entry of the process in the instance's pane.
+	claudeProcess *claudestatus.Process
 	// ended is true if the instance's tmux session is gone.
 	ended bool
 }
@@ -1261,6 +1304,7 @@ func tickUpdateMetadataCmd(active []*session.Instance, selected *session.Instanc
 					r.diffStats = instance.ComputeDiffNumstat()
 				}
 				r.claudeInfo = instance.ComputeClaudeInfo()
+				r.claudeProcess = instance.ComputeClaudeProcess()
 			}(idx, inst)
 		}
 		wg.Wait()
@@ -1289,6 +1333,19 @@ func (m *home) handleError(err error) tea.Cmd {
 		case <-time.After(3 * time.Second):
 		}
 
+		return hideErrMsg{}
+	}
+}
+
+// showInfo shows msg, a notice rather than an error, where errors show, for 3 seconds.
+func (m *home) showInfo(msg string) tea.Cmd {
+	log.InfoLog.Print(msg)
+	m.errBox.SetInfo(msg)
+	return func() tea.Msg {
+		select {
+		case <-m.ctx.Done():
+		case <-time.After(3 * time.Second):
+		}
 		return hideErrMsg{}
 	}
 }
@@ -1374,6 +1431,8 @@ func (m *home) View() string {
 		return overlay.PlaceOverlay(0, 0, m.confirmationOverlay.Render(), mainView, true, true)
 	} else if m.state == stateInput {
 		return overlay.PlaceOverlay(0, 0, m.inputOverlay.Render(), mainView, true, true)
+	} else if m.state == stateRemote {
+		return overlay.PlaceOverlay(0, 0, m.remoteOverlay.Render(), mainView, true, true)
 	}
 
 	return mainView

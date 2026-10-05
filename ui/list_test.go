@@ -10,6 +10,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/require"
 )
 
@@ -188,4 +189,29 @@ func TestListTitleShowsLimits(t *testing.T) {
 	title = strings.Split(l.String(), "\n")[1]
 	require.Contains(t, title, "Instances")
 	require.True(t, strings.HasSuffix(strings.TrimRight(title, " "), "5h 9% · wk 31%"), "title row: %q", title)
+}
+
+// A Claude session's Remote Control state shows as a badge between the title and the status
+// icon, and the title row keeps its width.
+func TestRenderRemoteControlBadge(t *testing.T) {
+	inst := newRenderTestInstance(t, "claude", nil)
+	inst.SetStatus(session.Paused)
+	title := func(selected bool) string {
+		t.Helper()
+		s := spinner.New()
+		r := &InstanceRenderer{spinner: &s}
+		r.setWidth(40)
+		row := strings.Split(r.Render(inst, 1, selected, 10), "\n")[0]
+		require.Equal(t, 40, lipgloss.Width(row), "row %q", row)
+		return ansi.Strip(row)
+	}
+	require.NotContains(t, title(false), "RC", "Remote Control is off")
+
+	inst.RemoteControl = true
+	require.True(t, strings.HasSuffix(strings.TrimRight(title(false), " "), "RC ⏸"), title(false))
+	require.True(t, strings.HasSuffix(strings.TrimRight(title(true), " "), "RC ⏸"), "selected: %q", title(true))
+
+	inst.Title = strings.Repeat("long title ", 4)
+	require.Contains(t, title(false), "...", "a long title gives way to the badge")
+	require.Contains(t, title(false), "RC ⏸")
 }

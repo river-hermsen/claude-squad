@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -10,11 +11,18 @@ import (
 type ErrBox struct {
 	height, width int
 	err           error
+	// info is true if err is a notice rather than an error; see SetInfo.
+	info bool
 }
 
 var errStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{
 	Light: "#FF0000",
 	Dark:  "#FF0000",
+})
+
+var infoStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{
+	Light: "#1a6fa8",
+	Dark:  "#4aa3df",
 })
 
 func NewErrBox() *ErrBox {
@@ -23,6 +31,13 @@ func NewErrBox() *ErrBox {
 
 func (e *ErrBox) SetError(err error) {
 	e.err = err
+	e.info = false
+}
+
+// SetInfo shows msg, a notice such as that a link was copied, in place of an error.
+func (e *ErrBox) SetInfo(msg string) {
+	e.err = errors.New(msg)
+	e.info = true
 }
 
 func (e *ErrBox) Clear() {
@@ -44,5 +59,9 @@ func (e *ErrBox) String() string {
 			err = runewidth.Truncate(err, e.width-3, "...")
 		}
 	}
-	return lipgloss.Place(e.width, e.height, lipgloss.Center, lipgloss.Center, errStyle.Render(err))
+	style := errStyle
+	if e.info {
+		style = infoStyle
+	}
+	return lipgloss.Place(e.width, e.height, lipgloss.Center, lipgloss.Center, style.Render(err))
 }

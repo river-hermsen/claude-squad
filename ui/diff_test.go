@@ -94,7 +94,7 @@ func TestMenuOffersRepoSwitchingInDiffTab(t *testing.T) {
 
 	m.SetActiveTab(DiffTab)
 	require.Contains(t, m.options, keys.KeyNextRepo)
-	require.Contains(t, m.String(), "n new • C resume claude • D kill • R rename • f fork │ ↵/o open • r resume │ shift+↑ scroll • ←/→ switch repo • tab switch tab │ ? help • q quit")
+	require.Contains(t, m.String(), "n new • C resume claude • D kill • R rename • f fork │ ↵/o open • r resume • w remote │ shift+↑ scroll • ←/→ switch repo • tab switch tab │ ? help • q quit")
 
 	m.SetInstance(newMultiRepoInstance(t, backendDiff))
 	require.NotContains(t, m.options, keys.KeyNextRepo, "nothing to switch between")

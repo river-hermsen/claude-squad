@@ -198,3 +198,33 @@ func TestSessionIDForPID(t *testing.T) {
 	require.Equal(t, "d5fe2a96-a8c7-42b1-a133-cc035bb028fb", SessionIDForPID(50251))
 	require.Empty(t, SessionIDForPID(1))
 }
+
+// Claude Code records a session's Remote Control connection in its registry, and sets it to
+// null when the session disconnects.
+func TestReadProcessRemoteSession(t *testing.T) {
+	claudeDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", claudeDir)
+	writeSettings(t, filepath.Join(claudeDir, "sessions", "3419664.json"),
+		`{"pid":3419664,"sessionId":"4a7c77ad-4cc4-41ae-bb7a-a51f0832c95e","kind":"interactive","bridgeSessionId":"session_01PGK9UUiG9Uvb8nTr2TH9bP"}`)
+	writeSettings(t, filepath.Join(claudeDir, "sessions", "3419665.json"),
+		`{"pid":3419665,"sessionId":"197f0c7d-cc2b-42f8-8b35-6dc2c9aa6b8f","kind":"interactive","bridgeSessionId":null}`)
+
+	p := ReadProcess(3419664)
+	require.NotNil(t, p)
+	require.Equal(t, "4a7c77ad-4cc4-41ae-bb7a-a51f0832c95e", p.SessionID)
+	require.Equal(t, "session_01PGK9UUiG9Uvb8nTr2TH9bP", p.RemoteSessionID)
+	require.Empty(t, ReadProcess(3419665).RemoteSessionID)
+	require.Nil(t, ReadProcess(1))
+	require.Nil(t, ReadProcess(0))
+}
+
+func TestHasTranscript(t *testing.T) {
+	claudeDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", claudeDir)
+	writeSettings(t, filepath.Join(claudeDir, "projects", "-home-river-Projects-FOYS-foys-all", "conv-1.jsonl"), "{}\n")
+
+	require.True(t, HasTranscript("conv-1"))
+	require.False(t, HasTranscript("conv-2"))
+	require.False(t, HasTranscript(""))
+	require.False(t, HasTranscript("*"), "an id is not a pattern")
+}

@@ -130,28 +130,32 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, m
 		descS = listDescStyle
 	}
 
-	// add spinner next to title if it's running
+	// The status icon, and before it the Remote Control badge, are drawn with the title's
+	// background, so a selected instance is tinted edge to edge.
+	bg := lipgloss.NewStyle().Background(titleS.GetBackground())
 	var join string
 	switch i.Status {
 	case session.Running, session.Loading:
-		join = fmt.Sprintf("%s ", r.spinner.View())
+		join = bg.Render(fmt.Sprintf("%s ", r.spinner.View()))
 	case session.Ready:
-		join = readyStyle.Render(readyIcon)
+		join = readyStyle.Inherit(bg).Render(readyIcon)
 	case session.Paused:
-		join = pausedStyle.Render(pausedIcon)
+		join = pausedStyle.Inherit(bg).Render(pausedIcon)
 	default:
 	}
+	badge := remoteBadge(i.RemoteState(), bg)
 
 	// Cut the title if it's too long
 	titleText := i.Title
-	widthAvail := r.width - 3 - runewidth.StringWidth(prefix) - 1
+	widthAvail := r.width - 3 - runewidth.StringWidth(prefix) - 1 - lipgloss.Width(badge)
 	if widthAvail > 0 && runewidth.StringWidth(titleText) > widthAvail {
 		titleText = runewidth.Truncate(titleText, widthAvail-3, "...")
 	}
 	title := titleS.Render(lipgloss.JoinHorizontal(
 		lipgloss.Left,
-		lipgloss.Place(r.width-3, 1, lipgloss.Left, lipgloss.Center, fmt.Sprintf("%s %s", prefix, titleText)),
-		" ",
+		lipgloss.Place(r.width-3-lipgloss.Width(badge), 1, lipgloss.Left, lipgloss.Center, fmt.Sprintf("%s %s", prefix, titleText)),
+		badge,
+		bg.Render(" "),
 		join,
 	))
 
@@ -201,6 +205,26 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, m
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, rows...)
 }
+
+// remoteBadge renders a Claude session's Remote Control state with bg's background: "RC" in
+// blue while claude.ai/code and the Claude app can reach the session, dimmed while it connects
+// (or connects again once resumed), red when it failed to. It is empty while Remote Control is off.
+func remoteBadge(state session.RemoteState, bg lipgloss.Style) string {
+	var color lipgloss.TerminalColor
+	switch state {
+	case session.RemoteOn:
+		color = remoteOnColor
+	case session.RemoteStarting:
+		color = pausedStyle.GetForeground()
+	case session.RemoteFailed:
+		color = removedLinesStyle.GetForeground()
+	default:
+		return ""
+	}
+	return bg.Bold(true).Foreground(color).Render("RC")
+}
+
+var remoteOnColor = lipgloss.Color("#4aa3df")
 
 // segment is a piece of an instance row, drawn in color or else in the row's own color.
 type segment struct {

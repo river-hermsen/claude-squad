@@ -233,24 +233,58 @@ func readInfo(path string) *Info {
 	return &info
 }
 
-// SessionIDForPID returns the id of the conversation that the Claude Code process pid runs,
-// from Claude Code's registry of running sessions, or "" if it cannot tell.
-func SessionIDForPID(pid int) string {
+// Process is the entry of a running Claude Code process in Claude Code's registry of running
+// sessions, ~/.claude/sessions/<pid>.json.
+type Process struct {
+	// SessionID is the id of the conversation the process runs, which `--resume` takes.
+	SessionID string `json:"sessionId"`
+	// RemoteSessionID is the claude.ai session that Remote Control connects the conversation
+	// to, or "" while Remote Control is off. Claude Code sets it to null on disconnect.
+	RemoteSessionID string `json:"bridgeSessionId"`
+}
+
+// ReadProcess returns the registry entry of the Claude Code process pid, or nil if there is
+// none, as when pid is not a Claude Code process.
+func ReadProcess(pid int) *Process {
 	dir := claudeConfigDir()
 	if dir == "" || pid <= 0 {
-		return ""
+		return nil
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "sessions", strconv.Itoa(pid)+".json"))
 	if err != nil {
-		return ""
+		return nil
 	}
-	var entry struct {
-		SessionID string `json:"sessionId"`
-	}
+	var entry Process
 	if err := json.Unmarshal(data, &entry); err != nil {
-		return ""
+		return nil
 	}
-	return entry.SessionID
+	return &entry
+}
+
+// SessionIDForPID returns the id of the conversation that the Claude Code process pid runs,
+// from Claude Code's registry of running sessions, or "" if it cannot tell.
+func SessionIDForPID(pid int) string {
+	if p := ReadProcess(pid); p != nil {
+		return p.SessionID
+	}
+	return ""
+}
+
+// RemoteURL returns the address of the Remote Control session remoteSessionID, where
+// claude.ai/code and the Claude app continue it.
+func RemoteURL(remoteSessionID string) string {
+	return "https://claude.ai/code/" + remoteSessionID
+}
+
+// HasTranscript reports whether Claude Code saved the conversation sessionID, which it does
+// once the conversation has a message. Only then can `--resume` continue it.
+func HasTranscript(sessionID string) bool {
+	dir := claudeConfigDir()
+	if dir == "" || sessionID == "" || strings.ContainsAny(sessionID, `/\*?[`) {
+		return false
+	}
+	matches, _ := filepath.Glob(filepath.Join(dir, "projects", "*", sessionID+".jsonl"))
+	return len(matches) > 0
 }
 
 // Remove deletes dir, a directory Dir returned.

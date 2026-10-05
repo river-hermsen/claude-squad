@@ -44,6 +44,14 @@ type Config struct {
 	BranchPrefix string `json:"branch_prefix"`
 	// Profiles is a list of named program profiles.
 	Profiles []Profile `json:"profiles,omitempty"`
+	// RemoteControl starts new Claude Code sessions with Remote Control on, so claude.ai/code
+	// and the Claude app can continue them. Unset means on; see RemoteControlEnabled.
+	RemoteControl *bool `json:"remote_control,omitempty"`
+}
+
+// RemoteControlEnabled reports whether new Claude Code sessions start with Remote Control on.
+func (c *Config) RemoteControlEnabled() bool {
+	return c.RemoteControl == nil || *c.RemoteControl
 }
 
 // GetProgram returns the program to run. If Profiles is non-empty and
@@ -89,10 +97,12 @@ func DefaultConfig() *Config {
 		program = defaultProgram
 	}
 
+	remoteControl := true
 	return &Config{
 		DefaultProgram:     program,
 		AutoYes:            false,
 		DaemonPollInterval: 1000,
+		RemoteControl:      &remoteControl,
 		BranchPrefix: func() string {
 			user, err := user.Current()
 			if err != nil || user == nil || user.Username == "" {

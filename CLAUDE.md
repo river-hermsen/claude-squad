@@ -56,6 +56,8 @@ All git isolation goes through a `Workspace` in `~/.claude-squad/workspaces/<bra
 - **`Start(false)`** (loaded from disk): reattaches to the existing tmux session. If the session is gone (`tmux.ErrSessionNotFound`), the instance is parked as `Paused` instead of erroring — `Storage.LoadInstances` aborts on the first error, so one dead session would hide all the others.
 - **`Pause`** (checkout, `c`): commits each worktree's changes, removes the worktrees but keeps the branches, detaches tmux, copies the branch name to the clipboard.
 - **`Resume`**: recreates only the worktrees that are missing or invalid (so it doesn't discard uncommitted work), then restores or restarts tmux. Refuses if a branch is checked out in its real repo.
+  - A restart (the tmux session had ended) of a Claude instance continues the conversation last seen in its pane: `--resume <InstanceData.ClaudeSessionID>`, if Claude Code saved it (`claudestatus.HasTranscript`, which needs one message). That also reconnects the conversation's Remote Control session, so its claude.ai link stays the same.
+  - If the session then ends within 15 s (`MarkEnded`), the conversation could not be continued: the id is dropped and the next `r` starts afresh.
 - **`Kill`**: closes tmux, then removes the worktrees, their branches (unless pre-existing), the workspace directory and the Claude settings directory.
   - Claude Code can move a conversation to the background, for example from its agents view, where it outlives tmux. Resuming it elsewhere then fails with "is running in the background".
   - So Kill first reads the pane's conversation id (`paneSessionID`). `stopBackgroundConversation` then polls `claude agents --json` a few times in a goroutine and runs `claude stop <id>` on the matching background entry. It matches by id prefix, or by `--name` plus cwd when the id is unknown.
@@ -67,7 +69,7 @@ All git isolation goes through a `Workspace` in `~/.claude-squad/workspaces/<bra
 - **Resume a conversation** (`C`, `ResumeConversation`): starts an instance titled `resume` that runs `claude --resume` without `--name`, which opens Claude's own picker inside the session. Ctrl+W there lists other worktrees' sessions.
   - cs goes straight into typing mode, so the picker takes your keys.
   - Once the status line reports `session_name`, the instance takes that name as its title (`AdoptClaudeName`, made unique and cut to 32 characters). It sends `/rename` back only if the title had to differ.
-- `launchArgs` (resume or fork flags) apply to the first `Start(true)` only. `Start` then resets the tmux program, so a later restart begins a new conversation.
+- `launchArgs` (resume or fork flags) apply to the first `Start(true)` only. `Start` then resets the tmux program; a later restart continues the pane's last conversation instead (see `Resume`).
 
 ### Multi-repo workspaces (`session/workspace/`, fork-specific)
 
@@ -108,9 +110,23 @@ The list's info row shows `<model> · <context used>/<window> · <effort>` for C
 - The metadata tick reads `status.json` for every active instance (`ComputeClaudeInfo` → `SetClaudeInfo`).
 - The limits belong to the account. The metadata tick reads `limits.json` and the list's title row shows it (`List.SetLimits`). It shows `5h – · wk –` before any limits are known, and 0% for a window whose reset time has passed.
 
+### Remote Control (`session/remote_control.go`, fork-specific)
+
+Remote Control connects a Claude session to a session on claude.ai, so claude.ai/code and the Claude app continue it while it keeps running on this machine (the VM or the laptop). Nothing moves between machines.
+
+- New Claude instances get `Instance.RemoteControl` from config `remote_control` (a `*bool`; unset means on) and launch with `--remote-control` after `--name`. The flag, not `remoteControlAtStartup` in cs's `--settings`, because background sessions inherit `--settings`. It is persisted, so restarts keep it.
+- Claude Code records the connection in its registry `~/.claude/sessions/<pid>.json` as `bridgeSessionId` (set to `null` on disconnect); the link is `https://claude.ai/code/<bridgeSessionId>`. Neither the status line input nor the docs carry it.
+  - The metadata tick reads the entry (`ComputeClaudeProcess` → `SetClaudeProcess`), which also yields the pane's conversation id that a restart resumes. A changed id is saved.
+- `RemoteState`: `RC` before the status icon in the list, blue when connected, gray while connecting / paused / waiting to send `/remote-control`, red when still off 45 s after it was asked for (trust dialog, login, network, or disconnected from Claude's own panel).
+- `w` (`app/remote.go`): when connected, it shows the link with a QR code (`skip2/go-qrcode`, dropped if the terminal is too short) and copies it.
+  - Copying tries the machine's clipboard, then `tmux load-buffer -w` inside tmux (tmux drops a program's OSC 52 by default), then OSC 52.
+  - `o` opens a browser (not over SSH). `d` turns `RemoteControl` off and sends `/remote-control`, which opens Claude's panel; cs switches to typing mode so the user picks "Disconnect this session". The panel's options vary, so cs does not navigate it.
+- `w` on a session without a connection sets `RemoteControl` and queues `/remote-control`. `SyncRemoteControl` sends it on an idle tick with an empty prompt, after `SyncClaudeName` and never in the same tick, and drops it if the session connected meanwhile; sent while connected, it would open the panel instead.
+- Verified against Claude Code 2.1.289: `--resume <id>` with or without `--remote-control` reconnects the same claude.ai session; `--resume <src> --fork-session` gets a new one and leaves the source's alone; `remoteControlAtStartup: true` in `--settings` works too.
+
 ### Persistence (`config/`, `session/storage.go`)
 
-- `~/.claude-squad/config.json` → `config.Config` (default program, `auto_yes`, `daemon_poll_interval`, `branch_prefix`, `profiles`). Created with defaults on first load; `DefaultConfig` resolves the `claude` path via the user's shell.
+- `~/.claude-squad/config.json` → `config.Config` (default program, `auto_yes`, `daemon_poll_interval`, `branch_prefix`, `profiles`, `remote_control`). Created with defaults on first load; `DefaultConfig` resolves the `claude` path via the user's shell.
 - `~/.claude-squad/state.json` → `config.State`; instances are stored as raw JSON and decoded by `session.Storage`.
 - Only started instances are saved. Adding a persisted field means updating `InstanceData` / `WorkspaceData` **and** both `ToInstanceData` and `FromInstanceData`.
 
@@ -146,7 +162,7 @@ Both detect screens by literal UI strings. Support for a new agent, or a fix aft
 
 ### Keybindings
 
-`keys/keys.go` is the source of truth (`GlobalKeyStringsMap` + `GlobalkeyBindings`). This fork removed upstream's push key (`p`), along with all `gh` usage; pushing is left to the user or the agent. It added `R` (rename), `f` (fork) and `` ` `` (type into the session).
+`keys/keys.go` is the source of truth (`GlobalKeyStringsMap` + `GlobalkeyBindings`). This fork removed upstream's push key (`p`), along with all `gh` usage; pushing is left to the user or the agent. It added `R` (rename), `f` (fork), `` ` `` (type into the session) and `w` (Remote Control).
 
 - **Typing mode** (`stateFocus`): `` ` `` switches to the Preview tab. `handleKeyPress` then sends every key except `` ` `` to the selected session.
   - `keyBytes` turns a key back into terminal bytes. Pastes keep their bracketed-paste markers.
