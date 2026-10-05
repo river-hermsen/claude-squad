@@ -214,54 +214,6 @@ check_and_install_dependencies() {
         echo "tmux is already installed."
     fi
     
-    # Check for GitHub CLI (gh)
-    if ! command -v gh &> /dev/null; then
-        echo "GitHub CLI (gh) is not installed. Installing GitHub CLI..."
-        
-        if [[ "$PLATFORM" == "darwin" ]]; then
-            # macOS
-            if command -v brew &> /dev/null; then
-                ensure brew install gh
-            else
-                echo "Homebrew is not installed. Please install Homebrew first to install GitHub CLI."
-                echo "Visit https://brew.sh for installation instructions."
-                exit 1
-            fi
-        elif [[ "$PLATFORM" == "linux" ]]; then
-            # Linux
-            if command -v apt-get &> /dev/null; then
-                echo "Installing GitHub CLI on Debian/Ubuntu..."
-                ensure curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-                ensure sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-                ensure echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-                ensure sudo apt-get update
-                ensure sudo apt-get install -y gh
-            elif command -v dnf &> /dev/null; then
-                ensure sudo dnf install -y 'dnf-command(config-manager)'
-                ensure sudo dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
-                ensure sudo dnf install -y gh
-            elif command -v yum &> /dev/null; then
-                ensure sudo yum install -y yum-utils
-                ensure sudo yum-config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
-                ensure sudo yum install -y gh
-            elif command -v pacman &> /dev/null; then
-                ensure sudo pacman -S --noconfirm github-cli
-            else
-                echo "Could not determine package manager. Please install GitHub CLI manually."
-                echo "Visit https://github.com/cli/cli#installation for installation instructions."
-                exit 1
-            fi
-        elif [[ "$PLATFORM" == "windows" ]]; then
-            echo "For Windows, please install GitHub CLI manually."
-            echo "Visit https://github.com/cli/cli#installation for installation instructions."
-            exit 1
-        fi
-        
-        echo "GitHub CLI (gh) installed successfully."
-    else
-        echo "GitHub CLI (gh) is already installed."
-    fi
-    
     echo "All dependencies are installed."
 }
 

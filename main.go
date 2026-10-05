@@ -9,6 +9,7 @@ import (
 	"claude-squad/session"
 	"claude-squad/session/git"
 	"claude-squad/session/tmux"
+	"claude-squad/session/workspace"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -19,12 +20,13 @@ import (
 )
 
 var (
-	version     = "1.0.20"
-	programFlag string
-	autoYesFlag bool
-	daemonFlag  bool
-	binName     string
-	rootCmd     = &cobra.Command{
+	version       = "1.0.20"
+	programFlag   string
+	autoYesFlag   bool
+	daemonFlag    bool
+	workspaceFlag string
+	binName       string
+	rootCmd       = &cobra.Command{
 		Use:   "claude-squad",
 		Short: "Claude Squad - Manage multiple AI agents like Claude Code, Aider, Codex, and Amp.",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -39,16 +41,7 @@ var (
 				return err
 			}
 
-			// Check if we're in a git repository
-			currentDir, err := filepath.Abs(".")
-			if err != nil {
-				return fmt.Errorf("failed to get current directory: %w", err)
-			}
-
-			if !git.IsGitRepo(currentDir) {
-				return fmt.Errorf("error: %s must be run from within a git repository", binName)
-			}
-
+			// Outside a git repository, new sessions run in place instead of in a worktree.
 			cfg := config.LoadConfig()
 
 			// Program flag overrides config
@@ -99,6 +92,11 @@ var (
 			}
 			fmt.Println("Tmux sessions have been cleaned up")
 
+			if err := workspace.CleanupAll(); err != nil {
+				return fmt.Errorf("failed to cleanup workspaces: %w", err)
+			}
+			fmt.Println("Workspaces have been cleaned up")
+
 			if err := git.CleanupWorktrees(); err != nil {
 				return fmt.Errorf("failed to cleanup worktrees: %w", err)
 			}
@@ -135,6 +133,23 @@ var (
 		},
 	}
 
+	// hookCmd is the Claude Code PreToolUse hook installed in multi-repo sessions. Claude
+	// Code reads its stdout as the hook's response, so it must print nothing else there.
+	hookCmd = &cobra.Command{
+		Use:    "hook",
+		Short:  "Claude Code hook that isolates repositories in a multi-repo session",
+		Hidden: true,
+		Run: func(cmd *cobra.Command, args []string) {
+			// No log.Close: it prints the log path to stdout.
+			log.Initialize(false)
+			if err := workspace.RunHook(workspaceFlag, os.Stdin, os.Stdout); err != nil {
+				log.ErrorLog.Printf("workspace hook failed: %v", err)
+				fmt.Fprintf(os.Stderr, "claude-squad hook: %v\n", err)
+				os.Exit(1)
+			}
+		},
+	}
+
 	versionCmd = &cobra.Command{
 		Use:   "version",
 		Short: "Print the version number",
@@ -159,7 +174,13 @@ func init() {
 		panic(err)
 	}
 
+	hookCmd.Flags().StringVar(&workspaceFlag, "workspace", "", "Workspace directory of the session")
+	if err := hookCmd.MarkFlagRequired("workspace"); err != nil {
+		panic(err)
+	}
+
 	rootCmd.AddCommand(debugCmd)
+	rootCmd.AddCommand(hookCmd)
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(resetCmd)
 }

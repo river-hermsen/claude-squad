@@ -34,6 +34,17 @@ type GitWorktree struct {
 	isExistingBranch bool
 }
 
+// NewGitWorktreeAt creates a GitWorktree for a new session branch with an explicit
+// worktree path, for callers that manage where their worktrees live.
+func NewGitWorktreeAt(repoPath string, worktreePath string, sessionName string, branchName string) *GitWorktree {
+	return &GitWorktree{
+		repoPath:     repoPath,
+		worktreePath: worktreePath,
+		sessionName:  sessionName,
+		branchName:   branchName,
+	}
+}
+
 func NewGitWorktreeFromStorage(repoPath string, worktreePath string, sessionName string, branchName string, baseCommitSHA string, isExistingBranch bool) *GitWorktree {
 	return &GitWorktree{
 		repoPath:         repoPath,
@@ -69,13 +80,18 @@ func resolveWorktreePaths(repoPath string, branchName string) (resolvedRepo stri
 	return resolvedRepo, worktreePath, nil
 }
 
-// NewGitWorktree creates a new GitWorktree instance
-func NewGitWorktree(repoPath string, sessionName string) (tree *GitWorktree, branchname string, err error) {
+// BranchNameFor returns the branch name for a session: the configured prefix plus the
+// session name.
+func BranchNameFor(sessionName string) string {
 	cfg := config.LoadConfig()
-	branchName := fmt.Sprintf("%s%s", cfg.BranchPrefix, sessionName)
 	// Sanitize the final branch name to handle invalid characters from any source
 	// (e.g., backslashes from Windows domain usernames like DOMAIN\user)
-	branchName = sanitizeBranchName(branchName)
+	return sanitizeBranchName(fmt.Sprintf("%s%s", cfg.BranchPrefix, sessionName))
+}
+
+// NewGitWorktree creates a new GitWorktree instance
+func NewGitWorktree(repoPath string, sessionName string) (tree *GitWorktree, branchname string, err error) {
+	branchName := BranchNameFor(sessionName)
 
 	repoPath, worktreePath, err := resolveWorktreePaths(repoPath, branchName)
 	if err != nil {

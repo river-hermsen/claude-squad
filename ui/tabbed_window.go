@@ -73,22 +73,16 @@ func (w *TabbedWindow) SetInstance(instance *session.Instance) {
 	w.instance = instance
 }
 
-// AdjustPreviewWidth adjusts the width of the preview pane to be 90% of the provided width.
-func AdjustPreviewWidth(width int) int {
-	return int(float64(width) * 0.9)
-}
-
+// SetSize sets the space the window fills, keeping one column free on the right.
 func (w *TabbedWindow) SetSize(width, height int) {
-	w.width = AdjustPreviewWidth(width)
+	// w.width is the content width inside the window's border.
+	w.width = width - 1 - windowStyle.GetHorizontalFrameSize()
 	w.height = height
 
-	// Calculate the content height by subtracting:
-	// 1. Tab height (including border and padding)
-	// 2. Window style vertical frame size
-	// 3. Additional padding/spacing (2 for the newline and spacing)
+	// The content height is what remains below the tabs and above the bottom border.
 	tabHeight := activeTabStyle.GetVerticalFrameSize() + 1
-	contentHeight := height - tabHeight - windowStyle.GetVerticalFrameSize() - 2
-	contentWidth := w.width - windowStyle.GetHorizontalFrameSize()
+	contentHeight := height - tabHeight - windowStyle.GetVerticalFrameSize()
+	contentWidth := w.width
 
 	w.preview.SetSize(contentWidth, contentHeight)
 	w.diff.SetSize(contentWidth, contentHeight)
@@ -167,6 +161,11 @@ func (w *TabbedWindow) ScrollDown() {
 // IsInPreviewTab returns true if the preview tab is currently active
 func (w *TabbedWindow) IsInPreviewTab() bool {
 	return w.activeTab == PreviewTab
+}
+
+// SwitchDiffRepo selects another repository in the diff tab of a multi-repo instance.
+func (w *TabbedWindow) SwitchDiffRepo(delta int) {
+	w.diff.SwitchRepo(delta)
 }
 
 // IsInDiffTab returns true if the diff tab is currently active
@@ -266,8 +265,8 @@ func (w *TabbedWindow) String() string {
 	}
 	window := windowStyle.Render(
 		lipgloss.Place(
-			w.width, w.height-2-windowStyle.GetVerticalFrameSize()-tabHeight,
+			w.width, w.height-windowStyle.GetVerticalFrameSize()-tabHeight,
 			lipgloss.Left, lipgloss.Top, content))
 
-	return lipgloss.JoinVertical(lipgloss.Left, "\n", row, window)
+	return lipgloss.JoinVertical(lipgloss.Left, row, window)
 }

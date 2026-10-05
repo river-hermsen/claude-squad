@@ -9,6 +9,9 @@ import (
 type DiffStats struct {
 	// Content is the full diff content
 	Content string
+	// Repos holds one diff per repository with changes, for diffs that span several
+	// repositories. Content is then left empty.
+	Repos []RepoDiff
 	// Added is the number of added lines
 	Added int
 	// Removed is the number of removed lines
@@ -16,6 +19,23 @@ type DiffStats struct {
 	// Error holds any error that occurred during diff computation
 	// This allows propagating setup errors (like missing base commit) without breaking the flow
 	Error error
+}
+
+// RepoDiff is one repository's part of a diff that spans several repositories.
+type RepoDiff struct {
+	Name    string
+	Added   int
+	Removed int
+	Content string
+}
+
+// RepoNames returns the names of the repositories in Repos, in order.
+func (d *DiffStats) RepoNames() []string {
+	names := make([]string, len(d.Repos))
+	for i, r := range d.Repos {
+		names[i] = r.Name
+	}
+	return names
 }
 
 func (d *DiffStats) IsEmpty() bool {
@@ -33,7 +53,7 @@ func (g *GitWorktree) Diff() *DiffStats {
 		return stats
 	}
 
-	content, err := g.runGitCommand(g.worktreePath, "--no-pager", "diff", g.GetBaseCommitSHA())
+	content, err := g.runGitCommand(g.worktreePath, "--no-pager", "diff", "--no-color", g.GetBaseCommitSHA())
 	if err != nil {
 		stats.Error = err
 		return stats
@@ -64,7 +84,7 @@ func (g *GitWorktree) DiffNumstat() *DiffStats {
 		return stats
 	}
 
-	out, err := g.runGitCommand(g.worktreePath, "--no-pager", "diff", "--numstat", g.GetBaseCommitSHA())
+	out, err := g.runGitCommand(g.worktreePath, "--no-pager", "diff", "--no-color", "--numstat", g.GetBaseCommitSHA())
 	if err != nil {
 		stats.Error = err
 		return stats

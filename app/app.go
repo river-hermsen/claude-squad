@@ -55,6 +55,9 @@ type home struct {
 
 	program string
 	autoYes bool
+	// inGitRepo is true if claude-squad was started inside a git repository. New instances
+	// get a worktree and branch picker only then; otherwise they run in the current directory.
+	inGitRepo bool
 
 	// storage is the interface for saving/loading data to/from the app's state
 	storage *session.Storage
@@ -117,6 +120,12 @@ func newHome(ctx context.Context, program string, autoYes bool) *home {
 		os.Exit(1)
 	}
 
+	currentDir, err := os.Getwd()
+	if err != nil {
+		fmt.Printf("Failed to get current directory: %v\n", err)
+		os.Exit(1)
+	}
+
 	h := &home{
 		ctx:          ctx,
 		spinner:      spinner.New(spinner.WithSpinner(spinner.MiniDot)),
@@ -127,6 +136,7 @@ func newHome(ctx context.Context, program string, autoYes bool) *home {
 		appConfig:    appConfig,
 		program:      program,
 		autoYes:      autoYes,
+		inGitRepo:    git.IsGitRepo(currentDir),
 		state:        stateDefault,
 		appState:     appState,
 	}
@@ -158,10 +168,11 @@ func (m *home) updateHandleWindowSizeEvent(msg tea.WindowSizeMsg) {
 	listWidth := int(float32(msg.Width) * 0.3)
 	tabsWidth := msg.Width - listWidth
 
-	// Menu takes 10% of height, list and window take 90%
-	contentHeight := int(float32(msg.Height) * 0.9)
-	menuHeight := msg.Height - contentHeight - 1     // minus 1 for error box
-	m.errBox.SetSize(int(float32(msg.Width)*0.9), 1) // error box takes 1 row
+	// One blank row on top, then the list and window, then one row each for the menu and
+	// the error box.
+	const menuHeight = 1
+	contentHeight := msg.Height - 1 - menuHeight - 1
+	m.errBox.SetSize(int(float32(msg.Width)*0.9), 1)
 
 	m.tabbedWindow.SetSize(tabsWidth, contentHeight)
 	m.list.SetSize(listWidth, contentHeight)
@@ -423,6 +434,9 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 				m.state = statePrompt
 				m.menu.SetState(ui.StatePrompt)
 				m.textInputOverlay = m.newPromptOverlay()
+				if !m.inGitRepo {
+					return m, tea.WindowSize()
+				}
 				// Trigger initial branch search (no debounce, version 0)
 				initialSearch := m.runBranchSearch("", m.textInputOverlay.BranchFilterVersion())
 				return m, tea.Batch(tea.WindowSize(), initialSearch)
@@ -616,10 +630,13 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		}
 
 		// Start a background fetch so branches are up to date by the time the picker opens
-		fetchCmd := func() tea.Msg {
-			currentDir, _ := os.Getwd()
-			git.FetchBranches(currentDir)
-			return nil
+		var fetchCmd tea.Cmd
+		if m.inGitRepo {
+			fetchCmd = func() tea.Msg {
+				currentDir, _ := os.Getwd()
+				git.FetchBranches(currentDir)
+				return nil
+			}
 		}
 
 		instance, err := session.NewInstance(session.InstanceOptions{
@@ -670,6 +687,16 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 	case keys.KeyShiftDown:
 		m.tabbedWindow.ScrollDown()
 		return m, m.instanceChanged()
+	case keys.KeyPrevRepo, keys.KeyNextRepo:
+		if !m.tabbedWindow.IsInDiffTab() {
+			return m, nil
+		}
+		delta := 1
+		if name == keys.KeyPrevRepo {
+			delta = -1
+		}
+		m.tabbedWindow.SwitchDiffRepo(delta)
+		return m, m.instanceChanged()
 	case keys.KeyTab:
 		m.tabbedWindow.Toggle()
 		m.menu.SetActiveTab(m.tabbedWindow.GetActiveTab())
@@ -682,13 +709,8 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 
 		// Create the kill action as a tea.Cmd
 		killAction := func() tea.Msg {
-			// Get worktree and check if branch is checked out
-			worktree, err := selected.GetGitWorktree()
-			if err != nil {
-				return err
-			}
-
-			checkedOut, err := worktree.IsBranchCheckedOut()
+			// Check if branch is checked out
+			checkedOut, err := selected.IsBranchCheckedOut()
 			if err != nil {
 				return err
 			}
@@ -713,33 +735,13 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		// Show confirmation modal
 		message := fmt.Sprintf("[!] Kill session '%s'?", selected.Title)
 		return m, m.confirmAction(message, killAction)
-	case keys.KeySubmit:
-		selected := m.list.GetSelectedInstance()
-		if selected == nil || selected.Status == session.Loading {
-			return m, nil
-		}
-
-		// Create the push action as a tea.Cmd
-		pushAction := func() tea.Msg {
-			// Default commit message with timestamp
-			commitMsg := fmt.Sprintf("[claudesquad] update from '%s' on %s", selected.Title, time.Now().Format(time.RFC822))
-			worktree, err := selected.GetGitWorktree()
-			if err != nil {
-				return err
-			}
-			if err = worktree.PushChanges(commitMsg, true); err != nil {
-				return err
-			}
-			return nil
-		}
-
-		// Show confirmation modal
-		message := fmt.Sprintf("[!] Push changes from session '%s'?", selected.Title)
-		return m, m.confirmAction(message, pushAction)
 	case keys.KeyCheckout:
 		selected := m.list.GetSelectedInstance()
 		if selected == nil || selected.Status == session.Loading {
 			return m, nil
+		}
+		if selected.InPlace() {
+			return m, m.handleError(fmt.Errorf("cannot check out session '%s': it is not in a git repository", selected.Title))
 		}
 
 		// Show help screen before pausing
@@ -997,6 +999,9 @@ func (m *home) handleError(err error) tea.Cmd {
 }
 
 func (m *home) newPromptOverlay() *overlay.TextInputOverlay {
+	if !m.inGitRepo {
+		return overlay.NewTextInputOverlayWithProfilePicker("Enter prompt", "", m.appConfig.GetProfiles())
+	}
 	return overlay.NewTextInputOverlayWithBranchPicker("Enter prompt", "", m.appConfig.GetProfiles())
 }
 

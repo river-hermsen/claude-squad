@@ -58,6 +58,24 @@ func (p *PreviewPane) UpdateContent(instance *session.Instance) error {
 	case instance.Status == session.Loading:
 		p.setFallbackState("Setting up workspace...")
 		return nil
+	case instance.Status == session.Paused && instance.InPlace():
+		p.setFallbackState("Session is paused. Press 'r' to resume.")
+		return nil
+	case instance.Status == session.Paused && instance.IsMultiRepo():
+		p.setFallbackState(lipgloss.JoinVertical(lipgloss.Center,
+			"Session is paused. Press 'r' to resume.",
+			"",
+			lipgloss.NewStyle().
+				Foreground(lipgloss.AdaptiveColor{
+					Light: "#FFD700",
+					Dark:  "#FFD700",
+				}).
+				Render(fmt.Sprintf(
+					"Each changed repository can be checked out at '%s' (copied to your clipboard)",
+					instance.Branch,
+				)),
+		))
+		return nil
 	case instance.Status == session.Paused:
 		p.setFallbackState(lipgloss.JoinVertical(lipgloss.Center,
 			"Session is paused. Press 'r' to resume.",

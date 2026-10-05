@@ -2,6 +2,7 @@ package ui
 
 import (
 	"claude-squad/keys"
+	"slices"
 	"strings"
 
 	"claude-squad/session"
@@ -43,26 +44,48 @@ const (
 )
 
 type Menu struct {
-	options       []keys.KeyName
-	height, width int
-	state         MenuState
-	instance      *session.Instance
-	activeTab     int
+	options []keys.KeyName
+	// groupEnds holds the index of the last option of each group; groups are separated by
+	// vertical bars. Options in [actionStart, actionEnd) are highlighted.
+	groupEnds              []int
+	actionStart, actionEnd int
+	height, width          int
+	state                  MenuState
+	instance               *session.Instance
+	activeTab              int
 
 	// keyDown is the key which is pressed. The default is -1.
 	keyDown keys.KeyName
 }
 
-var defaultMenuOptions = []keys.KeyName{keys.KeyNew, keys.KeyPrompt, keys.KeyHelp, keys.KeyQuit}
+var defaultMenuGroups = [][]keys.KeyName{{keys.KeyNew, keys.KeyPrompt}, {keys.KeyHelp, keys.KeyQuit}}
 var newInstanceMenuOptions = []keys.KeyName{keys.KeySubmitName}
 var promptMenuOptions = []keys.KeyName{keys.KeySubmitName}
 
 func NewMenu() *Menu {
-	return &Menu{
-		options:   defaultMenuOptions,
+	m := &Menu{
 		state:     StateEmpty,
 		activeTab: 0,
 		keyDown:   -1,
+	}
+	m.setGroups(0, defaultMenuGroups...)
+	return m
+}
+
+// setGroups sets the options from groups of keys. The group at index actionGroup is
+// highlighted; pass -1 for none. Empty groups are skipped.
+func (m *Menu) setGroups(actionGroup int, groups ...[]keys.KeyName) {
+	m.options, m.groupEnds = nil, nil
+	m.actionStart, m.actionEnd = 0, 0
+	for i, group := range groups {
+		if len(group) == 0 {
+			continue
+		}
+		if i == actionGroup {
+			m.actionStart, m.actionEnd = len(m.options), len(m.options)+len(group)
+		}
+		m.options = append(m.options, group...)
+		m.groupEnds = append(m.groupEnds, len(m.options)-1)
 	}
 }
 
@@ -104,53 +127,56 @@ func (m *Menu) SetActiveTab(tab int) {
 func (m *Menu) updateOptions() {
 	switch m.state {
 	case StateEmpty:
-		m.options = defaultMenuOptions
+		m.setGroups(0, defaultMenuGroups...)
 	case StateDefault:
 		if m.instance != nil {
 			// When there is an instance, show that instance's options
 			m.addInstanceOptions()
 		} else {
 			// When there is no instance, show the empty state
-			m.options = defaultMenuOptions
+			m.setGroups(0, defaultMenuGroups...)
 		}
 	case StateNewInstance:
-		m.options = newInstanceMenuOptions
+		m.setGroups(-1, newInstanceMenuOptions)
 	case StatePrompt:
-		m.options = promptMenuOptions
+		m.setGroups(-1, promptMenuOptions)
 	}
 }
 
 func (m *Menu) addInstanceOptions() {
 	// Loading instances only get minimal options
 	if m.instance != nil && m.instance.Status == session.Loading {
-		m.options = []keys.KeyName{keys.KeyNew, keys.KeyHelp, keys.KeyQuit}
+		m.setGroups(-1, []keys.KeyName{keys.KeyNew}, []keys.KeyName{keys.KeyHelp, keys.KeyQuit})
 		return
 	}
 
 	// Instance management group
-	options := []keys.KeyName{keys.KeyNew, keys.KeyKill}
+	managementGroup := []keys.KeyName{keys.KeyNew, keys.KeyKill}
 
-	// Action group
-	actionGroup := []keys.KeyName{keys.KeyEnter, keys.KeySubmit}
+	// Action group. Checkout needs a git worktree.
+	actionGroup := []keys.KeyName{keys.KeyEnter}
 	if m.instance.Status == session.Paused {
 		actionGroup = append(actionGroup, keys.KeyResume)
-	} else {
+	} else if !m.instance.InPlace() {
 		actionGroup = append(actionGroup, keys.KeyCheckout)
 	}
 
-	// Navigation group (when in diff tab)
+	// Navigation group
+	var navigationGroup []keys.KeyName
 	if m.activeTab == DiffTab || m.activeTab == TerminalTab {
-		actionGroup = append(actionGroup, keys.KeyShiftUp)
+		navigationGroup = append(navigationGroup, keys.KeyShiftUp)
 	}
+	if m.activeTab == DiffTab && m.instance.IsMultiRepo() {
+		if stats := m.instance.GetDiffStats(); stats != nil && len(stats.Repos) > 1 {
+			navigationGroup = append(navigationGroup, keys.KeyNextRepo)
+		}
+	}
+	navigationGroup = append(navigationGroup, keys.KeyTab)
 
 	// System group
-	systemGroup := []keys.KeyName{keys.KeyTab, keys.KeyHelp, keys.KeyQuit}
+	systemGroup := []keys.KeyName{keys.KeyHelp, keys.KeyQuit}
 
-	// Combine all groups
-	options = append(options, actionGroup...)
-	options = append(options, systemGroup...)
-
-	m.options = options
+	m.setGroups(1, managementGroup, actionGroup, navigationGroup, systemGroup)
 }
 
 // SetSize sets the width of the window. The menu will be centered horizontally within this width.
@@ -161,16 +187,6 @@ func (m *Menu) SetSize(width, height int) {
 
 func (m *Menu) String() string {
 	var s strings.Builder
-
-	// Define group boundaries
-	groups := []struct {
-		start int
-		end   int
-	}{
-		{0, 2}, // Instance management group (n, d)
-		{2, 5}, // Action group (enter, submit, pause/resume)
-		{6, 8}, // System group (tab, help, q)
-	}
 
 	for i, k := range m.options {
 		binding := keys.GlobalkeyBindings[k]
@@ -186,17 +202,7 @@ func (m *Menu) String() string {
 			localDescStyle = localDescStyle.Underline(true)
 		}
 
-		var inActionGroup bool
-		switch m.state {
-		case StateEmpty:
-			// For empty state, the action group is the first group
-			inActionGroup = i <= 1
-		default:
-			// For other states, the action group is the second group
-			inActionGroup = i >= groups[1].start && i < groups[1].end
-		}
-
-		if inActionGroup {
+		if i >= m.actionStart && i < m.actionEnd {
 			s.WriteString(localActionStyle.Render(binding.Help().Key))
 			s.WriteString(" ")
 			s.WriteString(localActionStyle.Render(binding.Help().Desc))
@@ -208,15 +214,9 @@ func (m *Menu) String() string {
 
 		// Add appropriate separator
 		if i != len(m.options)-1 {
-			isGroupEnd := false
-			for _, group := range groups {
-				if i == group.end-1 {
-					s.WriteString(sepStyle.Render(verticalSeparator))
-					isGroupEnd = true
-					break
-				}
-			}
-			if !isGroupEnd {
+			if slices.Contains(m.groupEnds, i) {
+				s.WriteString(sepStyle.Render(verticalSeparator))
+			} else {
 				s.WriteString(sepStyle.Render(separator))
 			}
 		}

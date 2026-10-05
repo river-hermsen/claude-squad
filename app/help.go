@@ -6,6 +6,8 @@ import (
 	"claude-squad/ui"
 	"claude-squad/ui/overlay"
 	"fmt"
+	"path/filepath"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -49,19 +51,55 @@ func (h helpTypeGeneral) toContent() string {
 		keyStyle.Render("ctrl-q")+descStyle.Render("    - Detach from session"),
 		"",
 		headerStyle.Render("Handoff:"),
-		keyStyle.Render("p")+descStyle.Render("         - Commit and push branch to github"),
 		keyStyle.Render("c")+descStyle.Render("         - Checkout: commit changes and pause session"),
 		keyStyle.Render("r")+descStyle.Render("         - Resume a paused session"),
 		"",
 		headerStyle.Render("Other:"),
 		keyStyle.Render("tab")+descStyle.Render("       - Switch between preview, diff, and terminal tabs"),
 		keyStyle.Render("shift-↓/↑")+descStyle.Render(" - Scroll in preview/diff/terminal view"),
+		keyStyle.Render("←/→")+descStyle.Render("       - Switch repository in the diff tab (multi-repo sessions)"),
 		keyStyle.Render("q")+descStyle.Render("         - Quit the application"),
 	)
 	return content
 }
 
 func (h helpTypeInstanceStart) toContent() string {
+	if h.instance.IsMultiRepo() {
+		return lipgloss.JoinVertical(lipgloss.Left,
+			titleStyle.Render("Instance Created"),
+			"",
+			descStyle.Render("New multi-repo session created:"),
+			descStyle.Render(fmt.Sprintf("• %s running in %s",
+				lipgloss.NewStyle().Bold(true).Render(filepath.Base(strings.Fields(h.instance.Program)[0])),
+				lipgloss.NewStyle().Bold(true).Render(h.instance.Path))),
+			descStyle.Render(fmt.Sprintf("• Each repository gets an isolated worktree on branch %s the first time it is changed",
+				lipgloss.NewStyle().Bold(true).Render(h.instance.Branch))),
+			"",
+			headerStyle.Render("Managing:"),
+			keyStyle.Render("↵/o")+descStyle.Render("   - Attach to the session to interact with it directly"),
+			keyStyle.Render("tab")+descStyle.Render("   - Switch preview panes to view the diff across repositories"),
+			keyStyle.Render("D")+descStyle.Render("     - Kill (delete) the session and its worktrees"),
+			"",
+			headerStyle.Render("Handoff:"),
+			keyStyle.Render("c")+descStyle.Render("     - Commit each changed repository and pause"),
+		)
+	}
+	if h.instance.InPlace() {
+		return lipgloss.JoinVertical(lipgloss.Left,
+			titleStyle.Render("Instance Created"),
+			"",
+			descStyle.Render("New session created:"),
+			descStyle.Render(fmt.Sprintf("• Directory: %s (not a git repository, so no isolated worktree)",
+				lipgloss.NewStyle().Bold(true).Render(h.instance.Path))),
+			descStyle.Render(fmt.Sprintf("• %s running in background tmux session",
+				lipgloss.NewStyle().Bold(true).Render(h.instance.Program))),
+			"",
+			headerStyle.Render("Managing:"),
+			keyStyle.Render("↵/o")+descStyle.Render("   - Attach to the session to interact with it directly"),
+			keyStyle.Render("D")+descStyle.Render("     - Kill (delete) the selected session"),
+		)
+	}
+
 	content := lipgloss.JoinVertical(lipgloss.Left,
 		titleStyle.Render("Instance Created"),
 		"",
@@ -78,7 +116,6 @@ func (h helpTypeInstanceStart) toContent() string {
 		"",
 		headerStyle.Render("Handoff:"),
 		keyStyle.Render("c")+descStyle.Render("     - Checkout this instance's branch"),
-		keyStyle.Render("p")+descStyle.Render("     - Push branch to GitHub to create a PR"),
 	)
 	return content
 }

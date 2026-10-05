@@ -21,7 +21,16 @@ type InstanceData struct {
 
 	Program   string          `json:"program"`
 	Worktree  GitWorktreeData `json:"worktree"`
+	Workspace *WorkspaceData  `json:"workspace,omitempty"`
 	DiffStats DiffStatsData   `json:"diff_stats"`
+}
+
+// WorkspaceData represents the serializable data of a workspace.Workspace. The list of
+// isolated repositories lives in the workspace directory itself.
+type WorkspaceData struct {
+	Root       string `json:"root"`
+	Dir        string `json:"dir"`
+	BranchName string `json:"branch_name"`
 }
 
 // GitWorktreeData represents the serializable data of a GitWorktree

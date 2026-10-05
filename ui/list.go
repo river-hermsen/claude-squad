@@ -5,6 +5,7 @@ import (
 	"claude-squad/session"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -28,20 +29,20 @@ var pausedStyle = lipgloss.NewStyle().
 	Foreground(lipgloss.AdaptiveColor{Light: "#888888", Dark: "#888888"})
 
 var titleStyle = lipgloss.NewStyle().
-	Padding(1, 1, 0, 1).
+	Padding(0, 1).
 	Foreground(lipgloss.AdaptiveColor{Light: "#1a1a1a", Dark: "#dddddd"})
 
 var listDescStyle = lipgloss.NewStyle().
-	Padding(0, 1, 1, 1).
+	Padding(0, 1).
 	Foreground(lipgloss.AdaptiveColor{Light: "#A49FA5", Dark: "#777777"})
 
 var selectedTitleStyle = lipgloss.NewStyle().
-	Padding(1, 1, 0, 1).
+	Padding(0, 1).
 	Background(lipgloss.Color("#dde4f0")).
 	Foreground(lipgloss.AdaptiveColor{Light: "#1a1a1a", Dark: "#1a1a1a"})
 
 var selectedDescStyle = lipgloss.NewStyle().
-	Padding(0, 1, 1, 1).
+	Padding(0, 1).
 	Background(lipgloss.Color("#dde4f0")).
 	Foreground(lipgloss.AdaptiveColor{Light: "#1a1a1a", Dark: "#1a1a1a"})
 
@@ -78,7 +79,8 @@ func NewList(spinner *spinner.Model, autoYes bool) *List {
 func (l *List) SetSize(width, height int) {
 	l.width = width
 	l.height = height
-	l.renderer.setWidth(width)
+	// One column of margin on the left, and one between the list and the tabbed window.
+	l.renderer.setWidth(width - 2)
 }
 
 // SetSessionPreviewSize sets the height and width for the tmux sessions. This makes the stdout line have the correct
@@ -107,8 +109,9 @@ type InstanceRenderer struct {
 	width   int
 }
 
+// setWidth sets the width of a rendered item, minus the 2 columns of the item's padding.
 func (r *InstanceRenderer) setWidth(width int) {
-	r.width = AdjustPreviewWidth(width)
+	r.width = width - 2
 }
 
 // ɹ and ɻ are other options.
@@ -185,7 +188,22 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 	remainingWidth -= diffWidth
 
 	branch := i.Branch
-	if i.Started() && hasMultipleRepos {
+	if i.Started() && i.InPlace() {
+		// Runs in place outside a git repository: show the directory instead of a branch.
+		branch = filepath.Base(i.Path) + " (no git)"
+	} else if i.Started() && i.IsMultiRepo() {
+		// Spans a directory of repositories: show which of them have changes.
+		branch = filepath.Base(i.Path)
+		if stat != nil {
+			switch len(stat.Repos) {
+			case 0:
+			case 1:
+				branch += " · " + stat.Repos[0].Name
+			default:
+				branch += fmt.Sprintf(" · %d repos", len(stat.Repos))
+			}
+		}
+	} else if i.Started() && hasMultipleRepos {
 		repoName, err := i.RepoName()
 		if err != nil {
 			log.ErrorLog.Printf("could not get repo name in instance renderer: %v", err)
@@ -229,14 +247,12 @@ func (l *List) String() string {
 	const titleText = " Instances "
 	const autoYesText = " auto-yes "
 
-	// Write the title.
+	// Write the title, on the same row as the tab names next to it.
 	var b strings.Builder
 	b.WriteString("\n")
-	b.WriteString("\n")
 
-	// Write title line
-	// add padding of 2 because the border on list items adds some extra characters
-	titleWidth := AdjustPreviewWidth(l.width) + 2
+	// Write title line, as wide as the items
+	titleWidth := l.width - 2
 	if !l.autoyes {
 		b.WriteString(lipgloss.Place(
 			titleWidth, 1, lipgloss.Left, lipgloss.Bottom, mainTitle.Render(titleText)))
@@ -259,7 +275,8 @@ func (l *List) String() string {
 			b.WriteString("\n\n")
 		}
 	}
-	return lipgloss.Place(l.width, l.height, lipgloss.Left, lipgloss.Top, b.String())
+	return lipgloss.Place(l.width, l.height, lipgloss.Left, lipgloss.Top,
+		lipgloss.NewStyle().PaddingLeft(1).Render(b.String()))
 }
 
 // Down selects the next item in the list.

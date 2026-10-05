@@ -15,7 +15,6 @@ const (
 	KeyQuit
 	KeyReview
 	KeyPush
-	KeySubmit
 
 	KeyTab        // Tab is a special keybinding for switching between panes.
 	KeySubmitName // SubmitName is a special keybinding for submitting the name of a new instance.
@@ -32,6 +31,10 @@ const (
 	// Reorder keybindings
 	KeyMoveUp
 	KeyMoveDown
+
+	// Repository selection in the diff tab of multi-repo instances
+	KeyPrevRepo
+	KeyNextRepo
 )
 
 // GlobalKeyStringsMap is a global, immutable map string to keybinding.
@@ -53,8 +56,9 @@ var GlobalKeyStringsMap = map[string]KeyName{
 	"tab":        KeyTab,
 	"c":          KeyCheckout,
 	"r":          KeyResume,
-	"p":          KeySubmit,
 	"?":          KeyHelp,
+	"left":       KeyPrevRepo,
+	"right":      KeyNextRepo,
 }
 
 // GlobalkeyBindings is a global, immutable map of KeyName tot keybinding.
@@ -95,10 +99,6 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 		key.WithKeys("q"),
 		key.WithHelp("q", "quit"),
 	),
-	KeySubmit: key.NewBinding(
-		key.WithKeys("p"),
-		key.WithHelp("p", "push branch"),
-	),
 	KeyPrompt: key.NewBinding(
 		key.WithKeys("N"),
 		key.WithHelp("N", "new with prompt"),
@@ -123,6 +123,15 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 	KeyMoveDown: key.NewBinding(
 		key.WithKeys("J"),
 		key.WithHelp("J", "move down"),
+	),
+
+	KeyPrevRepo: key.NewBinding(
+		key.WithKeys("left"),
+		key.WithHelp("←", "previous repo"),
+	),
+	KeyNextRepo: key.NewBinding(
+		key.WithKeys("right"),
+		key.WithHelp("←/→", "switch repo"),
 	),
 
 	// -- Special keybindings --
