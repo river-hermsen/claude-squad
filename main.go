@@ -7,7 +7,7 @@ import (
 	"claude-squad/daemon"
 	"claude-squad/log"
 	"claude-squad/session"
-	"claude-squad/session/git"
+	"claude-squad/session/claudestatus"
 	"claude-squad/session/tmux"
 	"claude-squad/session/workspace"
 	"context"
@@ -25,6 +25,8 @@ var (
 	autoYesFlag   bool
 	daemonFlag    bool
 	workspaceFlag string
+	statusOutFlag string
+	limitsFlag    string
 	binName       string
 	rootCmd       = &cobra.Command{
 		Use:   "claude-squad",
@@ -97,10 +99,9 @@ var (
 			}
 			fmt.Println("Workspaces have been cleaned up")
 
-			if err := git.CleanupWorktrees(); err != nil {
-				return fmt.Errorf("failed to cleanup worktrees: %w", err)
+			if err := claudestatus.RemoveAll(); err != nil {
+				return fmt.Errorf("failed to remove Claude Code session settings: %w", err)
 			}
-			fmt.Println("Worktrees have been cleaned up")
 
 			// Kill any daemon that's running.
 			if err := daemon.StopDaemon(); err != nil {
@@ -150,6 +151,27 @@ var (
 		},
 	}
 
+	// statusLineCmd is the Claude Code status line of every Claude session. Claude Code shows
+	// its stdout, which is the user's own status line; see claudestatus.RunStatusLine.
+	statusLineCmd = &cobra.Command{
+		Use:    "statusline",
+		Short:  "Claude Code status line that reports a session's model, effort and context use",
+		Hidden: true,
+		Run: func(cmd *cobra.Command, args []string) {
+			// No log.Close: it prints the log path to stdout. A failure is only logged, so
+			// the user's status line still shows.
+			log.Initialize(false)
+			limitsPath := limitsFlag
+			if limitsPath == "" {
+				// Settings written before --limits existed.
+				limitsPath, _ = claudestatus.LimitsPath()
+			}
+			if err := claudestatus.RunStatusLine(statusOutFlag, limitsPath, os.Stdin, os.Stdout); err != nil {
+				log.ErrorLog.Printf("status line failed: %v", err)
+			}
+		},
+	}
+
 	versionCmd = &cobra.Command{
 		Use:   "version",
 		Short: "Print the version number",
@@ -179,8 +201,15 @@ func init() {
 		panic(err)
 	}
 
+	statusLineCmd.Flags().StringVar(&statusOutFlag, "out", "", "File to save the session's status to")
+	statusLineCmd.Flags().StringVar(&limitsFlag, "limits", "", "File to save the account's usage limits to")
+	if err := statusLineCmd.MarkFlagRequired("out"); err != nil {
+		panic(err)
+	}
+
 	rootCmd.AddCommand(debugCmd)
 	rootCmd.AddCommand(hookCmd)
+	rootCmd.AddCommand(statusLineCmd)
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(resetCmd)
 }

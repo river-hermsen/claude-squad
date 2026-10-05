@@ -35,6 +35,15 @@ const (
 	// Repository selection in the diff tab of multi-repo instances
 	KeyPrevRepo
 	KeyNextRepo
+
+	KeyRename
+	KeyFork
+	// KeyResumeClaude starts an instance that resumes a Claude Code conversation.
+	KeyResumeClaude
+	// KeyFocus sends the keys that follow to the selected session, without attaching to it.
+	KeyFocus
+	// KeyFocusExit is KeyFocus pressed again, while typing into a session; see KeyFocus.
+	KeyFocusExit
 )
 
 // GlobalKeyStringsMap is a global, immutable map string to keybinding.
@@ -59,6 +68,10 @@ var GlobalKeyStringsMap = map[string]KeyName{
 	"?":          KeyHelp,
 	"left":       KeyPrevRepo,
 	"right":      KeyNextRepo,
+	"R":          KeyRename,
+	"f":          KeyFork,
+	"C":          KeyResumeClaude,
+	"`":          KeyFocus,
 }
 
 // GlobalkeyBindings is a global, immutable map of KeyName tot keybinding.
@@ -134,7 +147,29 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 		key.WithHelp("←/→", "switch repo"),
 	),
 
+	KeyRename: key.NewBinding(
+		key.WithKeys("R"),
+		key.WithHelp("R", "rename"),
+	),
+	KeyFork: key.NewBinding(
+		key.WithKeys("f"),
+		key.WithHelp("f", "fork"),
+	),
+	KeyResumeClaude: key.NewBinding(
+		key.WithKeys("C"),
+		key.WithHelp("C", "resume claude"),
+	),
+	KeyFocus: key.NewBinding(
+		key.WithKeys("`"),
+		key.WithHelp("`", "type"),
+	),
+
 	// -- Special keybindings --
+
+	KeyFocusExit: key.NewBinding(
+		key.WithKeys("`"),
+		key.WithHelp("`", "back to list"),
+	),
 
 	KeySubmitName: key.NewBinding(
 		key.WithKeys("enter"),

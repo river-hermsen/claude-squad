@@ -177,21 +177,14 @@ func (p *PreviewPane) String() string {
 		return p.viewport.View()
 	}
 
-	// Normal mode display
-	// Calculate available height accounting for border and margin
-	availableHeight := p.height - 1 //  1 for ellipsis
-
-	lines := strings.Split(p.previewState.text, "\n")
-
-	// Truncate if we have more lines than available height
-	if availableHeight > 0 {
-		if len(lines) > availableHeight {
-			lines = lines[:availableHeight]
-			lines = append(lines, "...")
+	// Normal mode display: the session's screen, which is sized to fill the pane.
+	lines := strings.Split(strings.TrimSuffix(p.previewState.text, "\n"), "\n")
+	if p.height > 0 {
+		if len(lines) > p.height {
+			// Keep the bottom, where an agent's prompt is.
+			lines = lines[len(lines)-p.height:]
 		} else {
-			// Pad with empty lines to fill available height
-			padding := availableHeight - len(lines)
-			lines = append(lines, make([]string, padding)...)
+			lines = append(lines, make([]string, p.height-len(lines))...)
 		}
 	}
 

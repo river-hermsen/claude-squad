@@ -240,7 +240,7 @@ func TestConfirmationFlowSimulation(t *testing.T) {
 		AutoYes: false,
 	})
 	require.NoError(t, err)
-	_ = list.AddInstance(instance)
+	list.AddInstance(instance)
 	list.SetSelectedInstance(0)
 
 	h := &home{

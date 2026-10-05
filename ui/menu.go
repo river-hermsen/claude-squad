@@ -53,12 +53,14 @@ type Menu struct {
 	state                  MenuState
 	instance               *session.Instance
 	activeTab              int
+	// focusMode is true while keys go to the selected session; see SetFocusMode.
+	focusMode bool
 
 	// keyDown is the key which is pressed. The default is -1.
 	keyDown keys.KeyName
 }
 
-var defaultMenuGroups = [][]keys.KeyName{{keys.KeyNew, keys.KeyPrompt}, {keys.KeyHelp, keys.KeyQuit}}
+var defaultMenuGroups = [][]keys.KeyName{{keys.KeyNew, keys.KeyPrompt, keys.KeyResumeClaude}, {keys.KeyHelp, keys.KeyQuit}}
 var newInstanceMenuOptions = []keys.KeyName{keys.KeySubmitName}
 var promptMenuOptions = []keys.KeyName{keys.KeySubmitName}
 
@@ -117,6 +119,12 @@ func (m *Menu) SetInstance(instance *session.Instance) {
 	m.updateOptions()
 }
 
+// SetFocusMode makes the menu, while on is true, only say that keys go to the selected
+// session and how to stop.
+func (m *Menu) SetFocusMode(on bool) {
+	m.focusMode = on
+}
+
 // SetActiveTab updates the currently active tab
 func (m *Menu) SetActiveTab(tab int) {
 	m.activeTab = tab
@@ -150,15 +158,21 @@ func (m *Menu) addInstanceOptions() {
 		return
 	}
 
-	// Instance management group
-	managementGroup := []keys.KeyName{keys.KeyNew, keys.KeyKill}
+	// Instance management group. Forking continues a Claude Code conversation.
+	managementGroup := []keys.KeyName{keys.KeyNew, keys.KeyResumeClaude, keys.KeyKill, keys.KeyRename}
+	if m.instance.IsClaude() {
+		managementGroup = append(managementGroup, keys.KeyFork)
+	}
 
 	// Action group. Checkout needs a git worktree.
 	actionGroup := []keys.KeyName{keys.KeyEnter}
 	if m.instance.Status == session.Paused {
 		actionGroup = append(actionGroup, keys.KeyResume)
-	} else if !m.instance.InPlace() {
-		actionGroup = append(actionGroup, keys.KeyCheckout)
+	} else {
+		actionGroup = append(actionGroup, keys.KeyFocus)
+		if !m.instance.InPlace() {
+			actionGroup = append(actionGroup, keys.KeyCheckout)
+		}
 	}
 
 	// Navigation group
@@ -187,6 +201,14 @@ func (m *Menu) SetSize(width, height int) {
 
 func (m *Menu) String() string {
 	var s strings.Builder
+
+	if m.focusMode && m.instance != nil {
+		exit := keys.GlobalkeyBindings[keys.KeyFocusExit].Help()
+		s.WriteString(descStyle.Render("typing into " + m.instance.Title))
+		s.WriteString(sepStyle.Render(verticalSeparator))
+		s.WriteString(actionGroupStyle.Render(exit.Key + " " + exit.Desc))
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, menuStyle.Render(s.String()))
+	}
 
 	for i, k := range m.options {
 		binding := keys.GlobalkeyBindings[k]

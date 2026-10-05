@@ -5,6 +5,7 @@ import (
 	"claude-squad/keys"
 	"claude-squad/log"
 	"claude-squad/session"
+	"claude-squad/session/claudestatus"
 	"claude-squad/session/git"
 	"claude-squad/ui"
 	"claude-squad/ui/overlay"
@@ -25,6 +26,7 @@ const GlobalInstanceLimit = 10
 
 // Run is the main entrypoint into the application.
 func Run(ctx context.Context, program string, autoYes bool) error {
+	setTerminalTitle()
 	p := tea.NewProgram(
 		newHome(ctx, program, autoYes),
 		tea.WithAltScreen(),
@@ -32,6 +34,13 @@ func Run(ctx context.Context, program string, autoYes bool) error {
 	)
 	_, err := p.Run()
 	return err
+}
+
+// setTerminalTitle names the terminal window and tab claude-squad. OSC 0 sets both, where
+// Bubble Tea's SetWindowTitle only sets the window title, which macOS Terminal does not
+// show on a tab.
+func setTerminalTitle() {
+	fmt.Fprint(os.Stdout, "\x1b]0;claude-squad\x07")
 }
 
 type state int
@@ -46,6 +55,10 @@ const (
 	stateHelp
 	// stateConfirm is the state when a confirmation modal is displayed.
 	stateConfirm
+	// stateInput is the state when inputOverlay asks for a line of text, such as a title.
+	stateInput
+	// stateFocus is the state when keys go to the selected session, shown in the preview.
+	stateFocus
 )
 
 type home struct {
@@ -70,10 +83,6 @@ type home struct {
 
 	// state is the current discrete state of the application
 	state state
-	// newInstanceFinalizer is called when the state is stateNew and then you press enter.
-	// It registers the new instance in the list after the instance has been started.
-	newInstanceFinalizer func()
-
 	// promptAfterName tracks if we should enter prompt mode after naming
 	promptAfterName bool
 
@@ -104,6 +113,9 @@ type home struct {
 	textOverlay *overlay.TextOverlay
 	// confirmationOverlay displays confirmation modals
 	confirmationOverlay *overlay.ConfirmationOverlay
+	// inputOverlay asks for a line of text in stateInput, which onInputSubmit then gets.
+	inputOverlay  *overlay.InputOverlay
+	onInputSubmit func(value string) tea.Cmd
 }
 
 func newHome(ctx context.Context, program string, autoYes bool) *home {
@@ -141,6 +153,7 @@ func newHome(ctx context.Context, program string, autoYes bool) *home {
 		appState:     appState,
 	}
 	h.list = ui.NewList(&h.spinner, autoYes)
+	h.list.SetLimits(readLimits())
 
 	// Load saved instances
 	instances, err := storage.LoadInstances()
@@ -151,8 +164,7 @@ func newHome(ctx context.Context, program string, autoYes bool) *home {
 
 	// Add loaded instances to the list
 	for _, instance := range instances {
-		// Call the finalizer immediately.
-		h.list.AddInstance(instance)()
+		h.list.AddInstance(instance)
 		if autoYes {
 			instance.AutoYes = true
 		}
@@ -220,6 +232,11 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case keyupMsg:
 		m.menu.ClearKeydown()
 		return m, nil
+	case previewRefreshMsg:
+		if err := m.tabbedWindow.UpdatePreview(m.list.GetSelectedInstance()); err != nil {
+			log.WarningLog.Printf("could not refresh preview: %v", err)
+		}
+		return m, nil
 	case instanceStartDoneMsg:
 		m.instanceStarting = false
 		inst := msg.instance
@@ -247,9 +264,19 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		return m, tea.Batch(tea.WindowSize(), m.instanceChanged())
 	case metadataUpdateDoneMsg:
+		if msg.limits != nil {
+			m.list.SetLimits(msg.limits)
+		}
 		for _, r := range msg.results {
 			// Skip instances that were paused while metadata was being computed
 			if r.instance.Status == session.Paused {
+				continue
+			}
+			if r.ended {
+				// The program exited, taking its tmux session with it. Pause the instance, as
+				// for a session lost to a tmux restart, so it can be resumed or killed.
+				log.WarningLog.Printf("tmux session for %q ended; pausing instance so it can be resumed", r.instance.Title)
+				r.instance.SetStatus(session.Paused)
 				continue
 			}
 			if r.updated {
@@ -258,6 +285,10 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				r.instance.TapEnter()
 			} else {
 				r.instance.SetStatus(session.Ready)
+				// A renamed Claude session takes its new name once it is idle.
+				if _, err := r.instance.SyncClaudeName(); err != nil {
+					log.WarningLog.Printf("could not rename Claude session: %v", err)
+				}
 			}
 			if r.diffStats != nil && r.diffStats.Error != nil {
 				if !strings.Contains(r.diffStats.Error.Error(), "base commit SHA not set") {
@@ -266,6 +297,12 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				r.instance.SetDiffStats(nil)
 			} else {
 				r.instance.SetDiffStats(r.diffStats)
+			}
+			if r.claudeInfo != nil {
+				r.instance.SetClaudeInfo(r.claudeInfo)
+				if r.instance.AdoptsClaudeName() && r.claudeInfo.SessionName != "" {
+					m.adoptClaudeName(r.instance, r.claudeInfo.SessionName)
+				}
 			}
 		}
 		return m, tickUpdateMetadataCmd(m.snapshotActiveInstances(), m.list.GetSelectedInstance())
@@ -276,6 +313,11 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				selected := m.list.GetSelectedInstance()
 				if selected == nil || selected.Status == session.Paused {
 					return m, nil
+				}
+				// A program that handles the mouse, like Claude Code's fullscreen UI, scrolls
+				// itself; its output is not in tmux's scrollback.
+				if m.tabbedWindow.IsInPreviewTab() && selected.ScrollSession(msg.Button == tea.MouseButtonWheelUp) {
+					return m, refreshPreviewSoon()
 				}
 
 				switch msg.Button {
@@ -333,6 +375,14 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.state = statePrompt
 			m.menu.SetState(ui.StatePrompt)
 			m.textInputOverlay = m.newPromptOverlay()
+		} else if msg.instance.AdoptsClaudeName() {
+			// Keys go straight to Claude's conversation picker.
+			m.menu.SetState(ui.StateDefault)
+			if m.state == stateDefault {
+				m.tabbedWindow.SetActiveTab(ui.PreviewTab)
+				m.menu.SetActiveTab(ui.PreviewTab)
+				m.state = stateFocus
+			}
 		} else {
 			// If instance has a prompt (set from Shift+N flow), send it now
 			if msg.instance.Prompt != "" {
@@ -396,6 +446,13 @@ func (m *home) handleMenuHighlighting(msg tea.KeyMsg) (cmd tea.Cmd, returnEarly 
 }
 
 func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
+	switch m.state {
+	case stateFocus:
+		return m.handleFocusKey(msg)
+	case stateInput:
+		return m.handleInputKey(msg)
+	}
+
 	cmd, returnEarly := m.handleMenuHighlighting(msg)
 	if returnEarly {
 		return m, cmd
@@ -442,9 +499,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 				return m, tea.Batch(tea.WindowSize(), initialSearch)
 			}
 
-			// Set Loading status and finalize into the list immediately
 			instance.SetStatus(session.Loading)
-			m.newInstanceFinalizer()
 			m.promptAfterName = false
 			m.state = stateDefault
 			m.menu.SetState(ui.StateDefault)
@@ -529,9 +584,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 					}
 					selected.Prompt = prompt
 
-					// Finalize into list and start
 					selected.SetStatus(session.Loading)
-					m.newInstanceFinalizer()
 					m.textInputOverlay = nil
 					m.state = stateDefault
 					m.menu.SetState(ui.StateDefault)
@@ -648,7 +701,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			return m, m.handleError(err)
 		}
 
-		m.newInstanceFinalizer = m.list.AddInstance(instance)
+		m.list.AddInstance(instance)
 		m.list.SetSelectedInstance(m.list.NumInstances() - 1)
 		m.state = stateNew
 		m.menu.SetState(ui.StateNewInstance)
@@ -669,7 +722,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			return m, m.handleError(err)
 		}
 
-		m.newInstanceFinalizer = m.list.AddInstance(instance)
+		m.list.AddInstance(instance)
 		m.list.SetSelectedInstance(m.list.NumInstances() - 1)
 		m.state = stateNew
 		m.menu.SetState(ui.StateNewInstance)
@@ -681,11 +734,16 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 	case keys.KeyDown:
 		m.list.Down()
 		return m, m.instanceChanged()
-	case keys.KeyShiftUp:
-		m.tabbedWindow.ScrollUp()
-		return m, m.instanceChanged()
-	case keys.KeyShiftDown:
-		m.tabbedWindow.ScrollDown()
+	case keys.KeyShiftUp, keys.KeyShiftDown:
+		up := name == keys.KeyShiftUp
+		if selected := m.list.GetSelectedInstance(); selected != nil && m.tabbedWindow.IsInPreviewTab() && selected.ScrollSession(up) {
+			return m, refreshPreviewSoon()
+		}
+		if up {
+			m.tabbedWindow.ScrollUp()
+		} else {
+			m.tabbedWindow.ScrollDown()
+		}
 		return m, m.instanceChanged()
 	case keys.KeyPrevRepo, keys.KeyNextRepo:
 		if !m.tabbedWindow.IsInDiffTab() {
@@ -769,6 +827,76 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			return m, m.instanceChanged()
 		}
 		return m, nil
+	case keys.KeyRename:
+		selected := m.list.GetSelectedInstance()
+		if selected == nil || !selected.Started() || selected.Status == session.Loading {
+			return m, nil
+		}
+		return m, m.askInput("Rename session", selected.Title, func(title string) tea.Cmd {
+			return m.renameInstance(selected, title)
+		})
+	case keys.KeyFork:
+		selected := m.list.GetSelectedInstance()
+		if selected == nil || !selected.Started() || selected.Status == session.Loading {
+			return m, nil
+		}
+		if m.list.NumInstances() >= GlobalInstanceLimit {
+			return m, m.handleError(
+				fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
+		}
+		if !selected.IsClaude() {
+			return m, m.handleError(fmt.Errorf("only Claude Code sessions can be forked"))
+		}
+		if info := selected.GetClaudeInfo(); info == nil || info.SessionID == "" {
+			return m, m.handleError(fmt.Errorf("session '%s' has no conversation to fork yet: send it a message first", selected.Title))
+		}
+		title := runewidth.Truncate(selected.Title+"-fork", 32, "")
+		return m, m.askInput("Fork session as", title, func(title string) tea.Cmd {
+			return m.forkInstance(selected, title)
+		})
+	case keys.KeyResumeClaude:
+		if m.list.NumInstances() >= GlobalInstanceLimit {
+			return m, m.handleError(
+				fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
+		}
+		if !session.IsClaudeProgram(m.program) {
+			return m, m.handleError(fmt.Errorf("resuming a conversation needs Claude Code as the program, not %q", m.program))
+		}
+		// The instance is named after the conversation picked in Claude's picker; until
+		// then it has a placeholder name.
+		instance, err := session.NewInstance(session.InstanceOptions{
+			Title:   m.uniqueTitle("resume"),
+			Path:    ".",
+			Program: m.program,
+		})
+		if err != nil {
+			return m, m.handleError(err)
+		}
+		instance.ResumeConversation()
+		m.list.AddInstance(instance)
+		m.list.SelectInstance(instance)
+		instance.SetStatus(session.Loading)
+		start := func() tea.Msg {
+			return instanceStartedMsg{instance: instance, err: instance.Start(true)}
+		}
+		return m, tea.Batch(tea.WindowSize(), m.instanceChanged(), start)
+	case keys.KeyFocus:
+		selected := m.list.GetSelectedInstance()
+		if selected == nil || !selected.Started() || selected.Paused() || selected.Status == session.Loading || !selected.TmuxAlive() {
+			return m, nil
+		}
+		// Keys go to the session shown in the preview.
+		if !m.tabbedWindow.IsInPreviewTab() {
+			m.tabbedWindow.SetActiveTab(ui.PreviewTab)
+			m.menu.SetActiveTab(ui.PreviewTab)
+		}
+		if m.tabbedWindow.IsPreviewInScrollMode() {
+			if err := m.tabbedWindow.ResetPreviewToNormalMode(selected); err != nil {
+				return m, m.handleError(err)
+			}
+		}
+		m.state = stateFocus
+		return m, m.instanceChanged()
 	case keys.KeyResume:
 		selected := m.list.GetSelectedInstance()
 		if selected == nil || selected.Status == session.Loading {
@@ -795,6 +923,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 					return
 				}
 				<-ch
+				setTerminalTitle()
 				m.state = stateDefault
 			})
 			return m, nil
@@ -807,6 +936,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 				return
 			}
 			<-ch
+			setTerminalTitle()
 			m.state = stateDefault
 			m.instanceChanged()
 		})
@@ -814,6 +944,151 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 	default:
 		return m, nil
 	}
+}
+
+// handleFocusKey sends a key to the selected session, or with KeyFocus stops doing so.
+func (m *home) handleFocusKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if keys.GlobalKeyStringsMap[msg.String()] == keys.KeyFocus {
+		m.state = stateDefault
+		return m, nil
+	}
+	data := keyBytes(msg)
+	if len(data) == 0 {
+		return m, nil
+	}
+	selected := m.list.GetSelectedInstance()
+	if selected == nil {
+		m.state = stateDefault
+		return m, nil
+	}
+	if err := selected.SendKeys(string(data)); err != nil {
+		m.state = stateDefault
+		return m, m.handleError(err)
+	}
+	return m, refreshPreviewSoon()
+}
+
+// refreshPreviewSoon shows a session's response to keys or scrolling sooner than the next
+// preview tick would.
+func refreshPreviewSoon() tea.Cmd {
+	return tea.Tick(30*time.Millisecond, func(time.Time) tea.Msg { return previewRefreshMsg{} })
+}
+
+// askInput shows an overlay that asks for a line of text, starting as value, and passes what
+// the user enters to onSubmit.
+func (m *home) askInput(title string, value string, onSubmit func(value string) tea.Cmd) tea.Cmd {
+	m.inputOverlay = overlay.NewInputOverlay(title, value, 32)
+	m.inputOverlay.SetWidth(50)
+	m.onInputSubmit = onSubmit
+	m.state = stateInput
+	return nil
+}
+
+func (m *home) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if !m.inputOverlay.HandleKeyPress(msg) {
+		return m, nil
+	}
+	input, onSubmit := m.inputOverlay, m.onInputSubmit
+	m.inputOverlay, m.onInputSubmit = nil, nil
+	m.state = stateDefault
+	if !input.Submitted() {
+		return m, nil
+	}
+	return m, onSubmit(strings.TrimSpace(input.Value()))
+}
+
+// validateTitle checks title for an instance, other than self, that is being named.
+func (m *home) validateTitle(title string, self *session.Instance) error {
+	if title == "" {
+		return fmt.Errorf("title cannot be empty")
+	}
+	if runewidth.StringWidth(title) > 32 {
+		return fmt.Errorf("title cannot be longer than 32 characters")
+	}
+	for _, inst := range m.list.GetInstances() {
+		if inst != self && inst.Title == title {
+			return fmt.Errorf("a session named '%s' already exists", title)
+		}
+	}
+	return nil
+}
+
+// renameInstance renames inst to title. Keeping the same title still gives the running
+// Claude Code session that name, for sessions started before cs named them.
+func (m *home) renameInstance(inst *session.Instance, title string) tea.Cmd {
+	if err := m.validateTitle(title, inst); err != nil {
+		return m.handleError(err)
+	}
+	oldTitle := inst.Title
+	if err := inst.Rename(title); err != nil {
+		return m.handleError(err)
+	}
+	// The terminal tab's shell is kept by title; it starts again under the new one.
+	m.tabbedWindow.CleanupTerminalForInstance(oldTitle)
+	if err := m.storage.SaveInstances(m.list.GetInstances()); err != nil {
+		return m.handleError(err)
+	}
+	return m.instanceChanged()
+}
+
+// uniqueTitle turns name into a title no other instance has: at most 32 characters, with a
+// number added if needed.
+func (m *home) uniqueTitle(name string) string {
+	return m.uniqueTitleFor(nil, name)
+}
+
+// uniqueTitleFor is uniqueTitle for naming self, an instance whose own title does not count
+// as taken.
+func (m *home) uniqueTitleFor(self *session.Instance, name string) string {
+	name = strings.Join(strings.Fields(name), " ")
+	if name == "" {
+		name = "session"
+	}
+	taken := func(title string) bool {
+		for _, inst := range m.list.GetInstances() {
+			if inst != self && inst.Title == title {
+				return true
+			}
+		}
+		return false
+	}
+	title := strings.TrimSpace(runewidth.Truncate(name, 32, ""))
+	for n := 2; taken(title); n++ {
+		suffix := fmt.Sprintf(" %d", n)
+		title = strings.TrimSpace(runewidth.Truncate(name, 32-len(suffix), "")) + suffix
+	}
+	return title
+}
+
+// adoptClaudeName names inst, which resumed a conversation picked in Claude Code, after
+// that conversation.
+func (m *home) adoptClaudeName(inst *session.Instance, claudeName string) {
+	oldTitle := inst.Title
+	if err := inst.AdoptClaudeName(m.uniqueTitleFor(inst, claudeName), claudeName); err != nil {
+		log.WarningLog.Printf("could not name %s after its conversation: %v", oldTitle, err)
+		return
+	}
+	m.tabbedWindow.CleanupTerminalForInstance(oldTitle)
+	if err := m.storage.SaveInstances(m.list.GetInstances()); err != nil {
+		log.ErrorLog.Print(err)
+	}
+}
+
+func (m *home) forkInstance(src *session.Instance, title string) tea.Cmd {
+	if err := m.validateTitle(title, nil); err != nil {
+		return m.handleError(err)
+	}
+	fork, err := session.NewFork(src, title)
+	if err != nil {
+		return m.handleError(err)
+	}
+	m.list.AddInstance(fork)
+	m.list.SelectInstance(fork)
+	fork.SetStatus(session.Loading)
+	start := func() tea.Msg {
+		return instanceStartedMsg{instance: fork, err: fork.Start(true)}
+	}
+	return tea.Batch(tea.WindowSize(), m.instanceChanged(), start)
 }
 
 // instanceChanged updates the preview pane, menu, and diff pane based on the selected instance. It returns an error
@@ -857,6 +1132,9 @@ type hideErrMsg struct{}
 
 // previewTickMsg implements tea.Msg and triggers a preview update
 type previewTickMsg struct{}
+
+// previewRefreshMsg updates the preview once, without scheduling another update.
+type previewRefreshMsg struct{}
 
 type instanceChangedMsg struct{}
 
@@ -905,15 +1183,20 @@ func (m *home) runBranchSearch(filter string, version uint64) tea.Cmd {
 // instanceMetaResult holds the results of a single instance's metadata update,
 // computed in a background goroutine.
 type instanceMetaResult struct {
-	instance  *session.Instance
-	updated   bool
-	hasPrompt bool
-	diffStats *git.DiffStats
+	instance   *session.Instance
+	updated    bool
+	hasPrompt  bool
+	diffStats  *git.DiffStats
+	claudeInfo *claudestatus.Info
+	// ended is true if the instance's tmux session is gone.
+	ended bool
 }
 
 // metadataUpdateDoneMsg is sent when the background metadata update completes.
 type metadataUpdateDoneMsg struct {
 	results []instanceMetaResult
+	// limits are the account's usage limits Claude Code reported last, or nil.
+	limits *claudestatus.Limits
 }
 
 // instanceStartDoneMsg is sent when the background instance start completes.
@@ -957,8 +1240,9 @@ func tickUpdateMetadataCmd(active []*session.Instance, selected *session.Instanc
 	return func() tea.Msg {
 		time.Sleep(500 * time.Millisecond)
 
+		limits := readLimits()
 		if len(active) == 0 {
-			return metadataUpdateDoneMsg{}
+			return metadataUpdateDoneMsg{limits: limits}
 		}
 
 		results := make([]instanceMetaResult, len(active))
@@ -970,17 +1254,28 @@ func tickUpdateMetadataCmd(active []*session.Instance, selected *session.Instanc
 				r := &results[i]
 				r.instance = instance
 				r.updated, r.hasPrompt = instance.HasUpdated()
+				r.ended = instance.SessionEnded()
 				if instance == selected {
 					r.diffStats = instance.ComputeDiff()
 				} else {
 					r.diffStats = instance.ComputeDiffNumstat()
 				}
+				r.claudeInfo = instance.ComputeClaudeInfo()
 			}(idx, inst)
 		}
 		wg.Wait()
 
-		return metadataUpdateDoneMsg{results: results}
+		return metadataUpdateDoneMsg{results: results, limits: limits}
 	}
+}
+
+// readLimits reads the account's usage limits that Claude sessions last reported.
+func readLimits() *claudestatus.Limits {
+	path, err := claudestatus.LimitsPath()
+	if err != nil {
+		return nil
+	}
+	return claudestatus.ReadLimits(path)
 }
 
 // handleError handles all errors which get bubbled up to the app. sets the error message. We return a callback tea.Cmd that returns a hideErrMsg message
@@ -1048,6 +1343,9 @@ func (m *home) confirmAction(message string, action tea.Cmd) tea.Cmd {
 }
 
 func (m *home) View() string {
+	m.tabbedWindow.SetFocused(m.state == stateFocus)
+	m.menu.SetFocusMode(m.state == stateFocus)
+
 	listWithPadding := lipgloss.NewStyle().PaddingTop(1).Render(m.list.String())
 	previewWithPadding := lipgloss.NewStyle().PaddingTop(1).Render(m.tabbedWindow.String())
 	listAndPreview := lipgloss.JoinHorizontal(lipgloss.Top, listWithPadding, previewWithPadding)
@@ -1074,6 +1372,8 @@ func (m *home) View() string {
 			log.ErrorLog.Printf("confirmation overlay is nil")
 		}
 		return overlay.PlaceOverlay(0, 0, m.confirmationOverlay.Render(), mainView, true, true)
+	} else if m.state == stateInput {
+		return overlay.PlaceOverlay(0, 0, m.inputOverlay.Render(), mainView, true, true)
 	}
 
 	return mainView

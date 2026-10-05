@@ -2,20 +2,9 @@ package git
 
 import (
 	"claude-squad/config"
-	"claude-squad/log"
 	"fmt"
 	"path/filepath"
-	"time"
 )
-
-func getWorktreeDirectory() (string, error) {
-	configDir, err := config.GetConfigDir()
-	if err != nil {
-		return "", err
-	}
-
-	return filepath.Join(configDir, "worktrees"), nil
-}
 
 // GitWorktree manages git worktree operations for a session
 type GitWorktree struct {
@@ -34,17 +23,9 @@ type GitWorktree struct {
 	isExistingBranch bool
 }
 
-// NewGitWorktreeAt creates a GitWorktree for a new session branch with an explicit
-// worktree path, for callers that manage where their worktrees live.
-func NewGitWorktreeAt(repoPath string, worktreePath string, sessionName string, branchName string) *GitWorktree {
-	return &GitWorktree{
-		repoPath:     repoPath,
-		worktreePath: worktreePath,
-		sessionName:  sessionName,
-		branchName:   branchName,
-	}
-}
-
+// NewGitWorktreeFromStorage creates a GitWorktree for a worktree at worktreePath of the
+// repository at repoPath. baseCommitSHA may be empty for a worktree that Setup has yet to
+// create; Setup records it.
 func NewGitWorktreeFromStorage(repoPath string, worktreePath string, sessionName string, branchName string, baseCommitSHA string, isExistingBranch bool) *GitWorktree {
 	return &GitWorktree{
 		repoPath:         repoPath,
@@ -56,30 +37,6 @@ func NewGitWorktreeFromStorage(repoPath string, worktreePath string, sessionName
 	}
 }
 
-// resolveWorktreePaths resolves the repo root and generates a unique worktree path for the given branch name.
-func resolveWorktreePaths(repoPath string, branchName string) (resolvedRepo string, worktreePath string, err error) {
-	absPath, err := filepath.Abs(repoPath)
-	if err != nil {
-		log.ErrorLog.Printf("git worktree path abs error, falling back to repoPath %s: %s", repoPath, err)
-		absPath = repoPath
-	}
-
-	resolvedRepo, err = findGitRepoRoot(absPath)
-	if err != nil {
-		return "", "", err
-	}
-
-	worktreeDir, err := getWorktreeDirectory()
-	if err != nil {
-		return "", "", err
-	}
-
-	worktreePath = filepath.Join(worktreeDir, sanitizeBranchName(branchName))
-	worktreePath = worktreePath + "_" + fmt.Sprintf("%x", time.Now().UnixNano())
-
-	return resolvedRepo, worktreePath, nil
-}
-
 // BranchNameFor returns the branch name for a session: the configured prefix plus the
 // session name.
 func BranchNameFor(sessionName string) string {
@@ -87,40 +44,6 @@ func BranchNameFor(sessionName string) string {
 	// Sanitize the final branch name to handle invalid characters from any source
 	// (e.g., backslashes from Windows domain usernames like DOMAIN\user)
 	return sanitizeBranchName(fmt.Sprintf("%s%s", cfg.BranchPrefix, sessionName))
-}
-
-// NewGitWorktree creates a new GitWorktree instance
-func NewGitWorktree(repoPath string, sessionName string) (tree *GitWorktree, branchname string, err error) {
-	branchName := BranchNameFor(sessionName)
-
-	repoPath, worktreePath, err := resolveWorktreePaths(repoPath, branchName)
-	if err != nil {
-		return nil, "", err
-	}
-
-	return &GitWorktree{
-		repoPath:     repoPath,
-		sessionName:  sessionName,
-		branchName:   branchName,
-		worktreePath: worktreePath,
-	}, branchName, nil
-}
-
-// NewGitWorktreeFromBranch creates a new GitWorktree that uses an existing branch.
-// The branch will not be deleted on cleanup.
-func NewGitWorktreeFromBranch(repoPath string, branchName string, sessionName string) (*GitWorktree, error) {
-	repoPath, worktreePath, err := resolveWorktreePaths(repoPath, branchName)
-	if err != nil {
-		return nil, err
-	}
-
-	return &GitWorktree{
-		repoPath:         repoPath,
-		sessionName:      sessionName,
-		branchName:       branchName,
-		worktreePath:     worktreePath,
-		isExistingBranch: true,
-	}, nil
 }
 
 // IsExistingBranch returns whether this worktree uses a pre-existing branch

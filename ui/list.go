@@ -3,10 +3,14 @@ package ui
 import (
 	"claude-squad/log"
 	"claude-squad/session"
+	"claude-squad/session/claudestatus"
+	"claude-squad/session/git"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/lipgloss"
@@ -60,17 +64,14 @@ type List struct {
 	height, width int
 	renderer      *InstanceRenderer
 	autoyes       bool
-
-	// map of repo name to number of instances using it. Used to display the repo name only if there are
-	// multiple repos in play.
-	repos map[string]int
+	// limits are the account's usage limits Claude Code reported last; nil before any did.
+	limits *claudestatus.Limits
 }
 
 func NewList(spinner *spinner.Model, autoYes bool) *List {
 	return &List{
 		items:    []*session.Instance{},
 		renderer: &InstanceRenderer{spinner: spinner},
-		repos:    make(map[string]int),
 		autoyes:  autoYes,
 	}
 }
@@ -114,10 +115,10 @@ func (r *InstanceRenderer) setWidth(width int) {
 	r.width = width - 2
 }
 
-// ɹ and ɻ are other options.
-const branchIcon = "Ꮧ"
-
-func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, hasMultipleRepos bool) string {
+// Render renders an instance as a title row and an info row: the repositories it changed,
+// the model, context use and effort Claude Code reports, and the diff counts. A selected
+// multi-repo instance lists its changed repositories below that, in at most maxRepoRows rows.
+func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, maxRepoRows int) string {
 	prefix := fmt.Sprintf(" %d. ", idx)
 	if idx >= 10 {
 		prefix = prefix[:len(prefix)-1]
@@ -154,93 +155,178 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 		join,
 	))
 
+	// Rows below the title line up with its text. Every part of them is drawn with base's
+	// background, so a selected instance is tinted edge to edge.
+	indent := runewidth.StringWidth(prefix) + 1
+	base := lipgloss.NewStyle().Foreground(descS.GetForeground()).Background(descS.GetBackground())
+
 	stat := i.GetDiffStats()
-
-	var diff string
-	var addedDiff, removedDiff string
-	if stat == nil || stat.Error != nil || stat.IsEmpty() {
-		// Don't show diff stats if there's an error or if they don't exist
-		addedDiff = ""
-		removedDiff = ""
-		diff = ""
-	} else {
-		addedDiff = fmt.Sprintf("+%d", stat.Added)
-		removedDiff = fmt.Sprintf("-%d ", stat.Removed)
-		diff = lipgloss.JoinHorizontal(
-			lipgloss.Center,
-			addedLinesStyle.Background(descS.GetBackground()).Render(addedDiff),
-			lipgloss.Style{}.Background(descS.GetBackground()).Foreground(descS.GetForeground()).Render(","),
-			removedLinesStyle.Background(descS.GetBackground()).Render(removedDiff),
-		)
+	var repos []git.RepoDiff
+	var counts string
+	if stat != nil && stat.Error == nil && !stat.IsEmpty() {
+		repos = stat.Repos
+		counts = diffCounts(stat.Added, stat.Removed, base)
 	}
 
-	remainingWidth := r.width
-	remainingWidth -= runewidth.StringWidth(prefix)
-	remainingWidth -= runewidth.StringWidth(branchIcon)
-	remainingWidth -= 2 // for the literal " " and "-" in the branchLine format string
-
-	diffWidth := runewidth.StringWidth(addedDiff) + runewidth.StringWidth(removedDiff)
-	if diffWidth > 0 {
-		diffWidth += 1
-	}
-
-	// Use fixed width for diff stats to avoid layout issues
-	remainingWidth -= diffWidth
-
-	branch := i.Branch
-	if i.Started() && i.InPlace() {
-		// Runs in place outside a git repository: show the directory instead of a branch.
-		branch = filepath.Base(i.Path) + " (no git)"
-	} else if i.Started() && i.IsMultiRepo() {
-		// Spans a directory of repositories: show which of them have changes.
-		branch = filepath.Base(i.Path)
-		if stat != nil {
-			switch len(stat.Repos) {
-			case 0:
-			case 1:
-				branch += " · " + stat.Repos[0].Name
-			default:
-				branch += fmt.Sprintf(" · %d repos", len(stat.Repos))
-			}
+	info := agentSegments(i)
+	switch {
+	case !i.Started() || i.InPlace():
+	case i.IsMultiRepo():
+		if !selected && len(repos) > 0 {
+			info = append([]segment{{text: fmt.Sprintf("%d %s", len(repos), plural(len(repos), "repo", "repos"))}}, info...)
 		}
-	} else if i.Started() && hasMultipleRepos {
-		repoName, err := i.RepoName()
-		if err != nil {
-			log.ErrorLog.Printf("could not get repo name in instance renderer: %v", err)
-		} else {
-			branch += fmt.Sprintf(" (%s)", repoName)
+	default:
+		if repo, err := i.RepoName(); err == nil {
+			// A long repository name gives way to the agent details after it.
+			room := r.width - indent - lipgloss.Width(counts) - 1 - segmentsWidth(info) - runewidth.StringWidth(rowSeparator)
+			repo = runewidth.Truncate(repo, max(room, 8), "…")
+			info = append([]segment{{text: repo}}, info...)
 		}
 	}
-	// Don't show branch if there's no space for it. Or show ellipsis if it's too long.
-	branchWidth := runewidth.StringWidth(branch)
-	if remainingWidth < 0 {
-		branch = ""
-	} else if remainingWidth < branchWidth {
-		if remainingWidth < 3 {
-			branch = ""
-		} else {
-			// We know the remainingWidth is at least 4 and branch is longer than that, so this is safe.
-			branch = runewidth.Truncate(branch, remainingWidth-3, "...")
+
+	rows := []string{title, descS.Render(r.row(indent, info, counts, base))}
+
+	if selected && i.IsMultiRepo() && len(repos) > 0 {
+		shown, more := repos, 0
+		if len(repos) > maxRepoRows {
+			shown = repos[:max(maxRepoRows-1, 0)]
+			more = len(repos) - len(shown)
+		}
+		for _, repo := range shown {
+			rows = append(rows, descS.Render(r.row(indent+2, []segment{{text: repo.Name}}, diffCounts(repo.Added, repo.Removed, base), base)))
+		}
+		if more > 0 {
+			rows = append(rows, descS.Render(r.row(indent+2, []segment{{text: fmt.Sprintf("%d more", more)}}, "", base)))
 		}
 	}
-	remainingWidth -= runewidth.StringWidth(branch)
+	return lipgloss.JoinVertical(lipgloss.Left, rows...)
+}
 
-	// Add spaces to fill the remaining width.
-	spaces := ""
-	if remainingWidth > 0 {
-		spaces = strings.Repeat(" ", remainingWidth)
+// segment is a piece of an instance row, drawn in color or else in the row's own color.
+type segment struct {
+	text  string
+	color lipgloss.TerminalColor
+}
+
+const rowSeparator = " · "
+
+func segmentsWidth(segments []segment) int {
+	width := 0
+	for k, s := range segments {
+		if k > 0 {
+			width += runewidth.StringWidth(rowSeparator)
+		}
+		width += runewidth.StringWidth(s.text)
+	}
+	return width
+}
+
+// row renders one row r.width wide: indent, then left joined by separators and cut short
+// if it does not fit, then right against the right edge.
+func (r *InstanceRenderer) row(indent int, left []segment, right string, base lipgloss.Style) string {
+	rightWidth := lipgloss.Width(right)
+	if indent+rightWidth > r.width {
+		right, rightWidth = "", 0
+	}
+	room := r.width - indent - rightWidth
+	if rightWidth > 0 {
+		room-- // keep a space before right
 	}
 
-	branchLine := fmt.Sprintf("%s %s-%s%s%s", strings.Repeat(" ", len(prefix)), branchIcon, branch, spaces, diff)
+	var b strings.Builder
+	b.WriteString(base.Render(strings.Repeat(" ", indent)))
+	used := 0
+	write := func(text string, color lipgloss.TerminalColor) bool {
+		if used+runewidth.StringWidth(text) > room {
+			text = runewidth.Truncate(text, max(room-used, 0), "…")
+		}
+		style := base
+		if color != nil {
+			style = style.Foreground(color)
+		}
+		b.WriteString(style.Render(text))
+		used += runewidth.StringWidth(text)
+		return used < room
+	}
+	for k, s := range left {
+		if k > 0 && !write(rowSeparator, nil) {
+			break
+		}
+		if !write(s.text, s.color) {
+			break
+		}
+	}
 
-	// join title and subtitle
-	text := lipgloss.JoinVertical(
-		lipgloss.Left,
-		title,
-		descS.Render(branchLine),
-	)
+	if pad := r.width - indent - used - rightWidth; pad > 0 {
+		b.WriteString(base.Render(strings.Repeat(" ", pad)))
+	}
+	b.WriteString(right)
+	return b.String()
+}
 
-	return text
+// diffCounts renders "+added,-removed " in the colors of the diff.
+func diffCounts(added, removed int, base lipgloss.Style) string {
+	bg := base.GetBackground()
+	return addedLinesStyle.Background(bg).Render(fmt.Sprintf("+%d", added)) +
+		base.Render(",") +
+		removedLinesStyle.Background(bg).Render(fmt.Sprintf("-%d", removed)) +
+		base.Render(" ")
+}
+
+// agentSegments describes the agent: the model, context use and effort Claude Code last
+// reported, or else the program's name.
+func agentSegments(i *session.Instance) []segment {
+	info := i.GetClaudeInfo()
+	if info == nil || info.Model == "" {
+		fields := strings.Fields(i.Program)
+		if len(fields) == 0 {
+			return nil
+		}
+		return []segment{{text: filepath.Base(fields[0])}}
+	}
+
+	// "Opus 4.6 (1M context)" repeats what the context size says.
+	model, _, _ := strings.Cut(info.Model, " (")
+	segments := []segment{{text: model}}
+	if info.ContextSize > 0 {
+		segments = append(segments, segment{
+			text:  formatTokens(info.ContextUsed) + "/" + formatTokens(info.ContextSize),
+			color: contextColor(info.ContextUsed, info.ContextSize),
+		})
+	}
+	if info.Effort != "" {
+		segments = append(segments, segment{text: info.Effort})
+	}
+	return segments
+}
+
+// formatTokens formats a token count the way Claude Code's status line does: 950, 92.1k, 200k, 1M.
+func formatTokens(n int) string {
+	short := func(v float64) string {
+		return strings.TrimSuffix(strconv.FormatFloat(v, 'f', 1, 64), ".0")
+	}
+	switch {
+	case n >= 1_000_000:
+		return short(float64(n)/1_000_000) + "M"
+	case n >= 1000:
+		return short(float64(n)/1000) + "k"
+	default:
+		return strconv.Itoa(n)
+	}
+}
+
+// contextColor warns when the context window is filling up: amber with less than half
+// left, red with less than a fifth.
+func contextColor(used, size int) lipgloss.TerminalColor {
+	left := float64(size-used) / float64(size)
+	switch {
+	case left < 0.2:
+		return removedLinesStyle.GetForeground()
+	case left < 0.5:
+		return lipgloss.Color("#c08400")
+	default:
+		return nil
+	}
 }
 
 func (l *List) String() string {
@@ -251,32 +337,94 @@ func (l *List) String() string {
 	var b strings.Builder
 	b.WriteString("\n")
 
-	// Write title line, as wide as the items
+	// Write the title line, as wide as the items: the title, then on the right the account's
+	// usage limits and the auto-yes badge.
 	titleWidth := l.width - 2
-	if !l.autoyes {
-		b.WriteString(lipgloss.Place(
-			titleWidth, 1, lipgloss.Left, lipgloss.Bottom, mainTitle.Render(titleText)))
-	} else {
-		title := lipgloss.Place(
-			titleWidth/2, 1, lipgloss.Left, lipgloss.Bottom, mainTitle.Render(titleText))
-		autoYes := lipgloss.Place(
-			titleWidth-(titleWidth/2), 1, lipgloss.Right, lipgloss.Bottom, autoYesStyle.Render(autoYesText))
-		b.WriteString(lipgloss.JoinHorizontal(
-			lipgloss.Top, title, autoYes))
+	title := mainTitle.Render(titleText)
+	var badge string
+	if l.autoyes {
+		badge = " " + autoYesStyle.Render(autoYesText)
 	}
+	room := titleWidth - lipgloss.Width(title) - lipgloss.Width(badge) - 2
+	right := renderLimits(l.limits, time.Now(), room) + badge
+	b.WriteString(title)
+	if pad := titleWidth - lipgloss.Width(title) - lipgloss.Width(right); pad > 0 {
+		b.WriteString(strings.Repeat(" ", pad))
+	}
+	b.WriteString(right)
 
 	b.WriteString("\n")
 	b.WriteString("\n")
+
+	// The selected instance's repository rows get whatever height the list has left: the
+	// title takes 3 rows, every instance 2 plus a blank row between them.
+	maxRepoRows := max(l.height-3-3*len(l.items)+1, 1)
 
 	// Render the list.
 	for i, item := range l.items {
-		b.WriteString(l.renderer.Render(item, i+1, i == l.selectedIdx, len(l.repos) > 1))
+		b.WriteString(l.renderer.Render(item, i+1, i == l.selectedIdx, maxRepoRows))
 		if i != len(l.items)-1 {
 			b.WriteString("\n\n")
 		}
 	}
 	return lipgloss.Place(l.width, l.height, lipgloss.Left, lipgloss.Top,
 		lipgloss.NewStyle().PaddingLeft(1).Render(b.String()))
+}
+
+// SetLimits sets the account's usage limits shown in the title row.
+func (l *List) SetLimits(limits *claudestatus.Limits) {
+	l.limits = limits
+}
+
+// renderLimits renders limits in at most width columns, as "5h 12% ↻15:00 · wk 40% ↻Fri",
+// dropping the reset times if they do not fit, and everything if that does not fit either.
+// Before Claude Code has reported any, it shows where they will appear: "5h – · wk –".
+func renderLimits(limits *claudestatus.Limits, now time.Time, width int) string {
+	if limits == nil {
+		dim := listDescStyle.UnsetPadding()
+		if text := dim.Render("5h – · wk –"); lipgloss.Width(text) <= width {
+			return text
+		}
+		return ""
+	}
+	for _, withResets := range []bool{true, false} {
+		text := renderLimit("5h", limits.FiveHour, now, withResets, "15:04") +
+			listDescStyle.UnsetPadding().Render(" · ") +
+			renderLimit("wk", limits.Week, now, withResets, "Mon")
+		if lipgloss.Width(text) <= width {
+			return text
+		}
+	}
+	return ""
+}
+
+// renderLimit renders one usage limit, colored by how much of it is used. resetLayout formats
+// the reset time when it is more than a day away; closer resets show the time of day.
+func renderLimit(label string, limit claudestatus.Limit, now time.Time, withReset bool, resetLayout string) string {
+	used := limit.UsedPercent
+	reset := ""
+	if !limit.ResetsAt.IsZero() {
+		if now.After(limit.ResetsAt) {
+			// The window has reset since Claude Code reported it.
+			used = 0
+		} else if withReset {
+			layout := resetLayout
+			if limit.ResetsAt.Sub(now) < 24*time.Hour {
+				layout = "15:04"
+			}
+			reset = " ↻" + limit.ResetsAt.Local().Format(layout)
+		}
+	}
+
+	color := readyStyle.GetForeground()
+	switch {
+	case used >= 80:
+		color = removedLinesStyle.GetForeground()
+	case used >= 50:
+		color = lipgloss.Color("#c08400")
+	}
+	dim := listDescStyle.UnsetPadding()
+	return dim.Render(label+" ") + lipgloss.NewStyle().Foreground(color).Render(fmt.Sprintf("%.0f%%", used)) + dim.Render(reset)
 }
 
 // Down selects the next item in the list.
@@ -308,14 +456,6 @@ func (l *List) Kill() {
 		defer l.Up()
 	}
 
-	// Unregister the reponame.
-	repoName, err := targetInstance.RepoName()
-	if err != nil {
-		log.ErrorLog.Printf("could not get repo name: %v", err)
-	} else {
-		l.rmRepo(repoName)
-	}
-
 	// Since there's items after this, the selectedIdx can stay the same.
 	l.items = append(l.items[:l.selectedIdx], l.items[l.selectedIdx+1:]...)
 }
@@ -337,39 +477,9 @@ func (l *List) Up() {
 	}
 }
 
-func (l *List) addRepo(repo string) {
-	if _, ok := l.repos[repo]; !ok {
-		l.repos[repo] = 0
-	}
-	l.repos[repo]++
-}
-
-func (l *List) rmRepo(repo string) {
-	if _, ok := l.repos[repo]; !ok {
-		log.ErrorLog.Printf("repo %s not found", repo)
-		return
-	}
-	l.repos[repo]--
-	if l.repos[repo] == 0 {
-		delete(l.repos, repo)
-	}
-}
-
-// AddInstance adds a new instance to the list. It returns a finalizer function that should be called when the instance
-// is started. If the instance was restored from storage or is paused, you can call the finalizer immediately.
-// When creating a new one and entering the name, you want to call the finalizer once the name is done.
-func (l *List) AddInstance(instance *session.Instance) (finalize func()) {
+// AddInstance adds a new instance to the end of the list.
+func (l *List) AddInstance(instance *session.Instance) {
 	l.items = append(l.items, instance)
-	// The finalizer registers the repo name once the instance is started.
-	return func() {
-		repoName, err := instance.RepoName()
-		if err != nil {
-			log.ErrorLog.Printf("could not get repo name: %v", err)
-			return
-		}
-
-		l.addRepo(repoName)
-	}
 }
 
 // GetSelectedInstance returns the currently selected instance

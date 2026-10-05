@@ -19,10 +19,11 @@ type InstanceData struct {
 	UpdatedAt time.Time `json:"updated_at"`
 	AutoYes   bool      `json:"auto_yes"`
 
-	Program   string          `json:"program"`
-	Worktree  GitWorktreeData `json:"worktree"`
-	Workspace *WorkspaceData  `json:"workspace,omitempty"`
-	DiffStats DiffStatsData   `json:"diff_stats"`
+	Program   string         `json:"program"`
+	Workspace *WorkspaceData `json:"workspace,omitempty"`
+	DiffStats DiffStatsData  `json:"diff_stats"`
+	// ClaudeDir holds the Claude Code settings and status of a Claude instance.
+	ClaudeDir string `json:"claude_dir,omitempty"`
 }
 
 // WorkspaceData represents the serializable data of a workspace.Workspace. The list of
@@ -31,16 +32,7 @@ type WorkspaceData struct {
 	Root       string `json:"root"`
 	Dir        string `json:"dir"`
 	BranchName string `json:"branch_name"`
-}
-
-// GitWorktreeData represents the serializable data of a GitWorktree
-type GitWorktreeData struct {
-	RepoPath         string `json:"repo_path"`
-	WorktreePath     string `json:"worktree_path"`
-	SessionName      string `json:"session_name"`
-	BranchName       string `json:"branch_name"`
-	BaseCommitSHA    string `json:"base_commit_sha"`
-	IsExistingBranch bool   `json:"is_existing_branch"`
+	SingleRepo string `json:"single_repo,omitempty"`
 }
 
 // DiffStatsData represents the serializable data of a DiffStats

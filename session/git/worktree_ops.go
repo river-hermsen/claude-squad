@@ -1,26 +1,14 @@
 package git
 
 import (
-	"claude-squad/log"
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 )
 
 // Setup creates a new worktree for the session
 func (g *GitWorktree) Setup() error {
-	// Ensure worktrees directory exists early (can be done in parallel with branch check)
-	worktreesDir, err := getWorktreeDirectory()
-	if err != nil {
-		return fmt.Errorf("failed to get worktree directory: %w", err)
-	}
-
-	if err := os.MkdirAll(worktreesDir, 0755); err != nil {
-		return err
-	}
-
 	// If this worktree uses a pre-existing branch, always set up from that branch
 	// (it may exist locally or only on the remote).
 	if g.isExistingBranch {
@@ -28,7 +16,7 @@ func (g *GitWorktree) Setup() error {
 	}
 
 	// Check if branch exists using git CLI (much faster than go-git PlainOpen)
-	_, err = g.runGitCommand(g.repoPath, "show-ref", "--verify", fmt.Sprintf("refs/heads/%s", g.branchName))
+	_, err := g.runGitCommand(g.repoPath, "show-ref", "--verify", fmt.Sprintf("refs/heads/%s", g.branchName))
 	if err == nil {
 		return g.setupFromExistingBranch()
 	}
@@ -167,70 +155,82 @@ func (g *GitWorktree) Prune() error {
 	return nil
 }
 
-// CleanupWorktrees removes all worktrees and their associated branches
-func CleanupWorktrees() error {
-	worktreesDir, err := getWorktreeDirectory()
-	if err != nil {
-		return fmt.Errorf("failed to get worktree directory: %w", err)
-	}
-
-	entries, err := os.ReadDir(worktreesDir)
-	if err != nil {
-		return fmt.Errorf("failed to read worktree directory: %w", err)
-	}
-
-	// Get a list of all branches associated with worktrees
-	cmd := exec.Command("git", "worktree", "list", "--porcelain")
-	output, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("failed to list worktrees: %w", err)
-	}
-
-	// Parse the output to extract branch names
-	worktreeBranches := make(map[string]string)
-	currentWorktree := ""
-	lines := strings.Split(string(output), "\n")
-	for _, line := range lines {
-		if strings.HasPrefix(line, "worktree ") {
-			currentWorktree = strings.TrimPrefix(line, "worktree ")
-		} else if strings.HasPrefix(line, "branch ") {
-			branchPath := strings.TrimPrefix(line, "branch ")
-			// Extract branch name from refs/heads/branch-name
-			branchName := strings.TrimPrefix(branchPath, "refs/heads/")
-			if currentWorktree != "" {
-				worktreeBranches[currentWorktree] = branchName
-			}
+// Snapshot captures the session's current files: head is the commit the worktree has
+// checked out, and snapshot a commit on top of it holding every file in the worktree,
+// tracked or untracked (ignored files excepted). It changes nothing: the worktree, its
+// index and its branch stay as they are. If the worktree is gone (the session is paused),
+// both are the tip of the session's branch, which then holds all the session's work.
+func (g *GitWorktree) Snapshot() (head string, snapshot string, err error) {
+	if valid, _ := g.IsValidWorktree(); !valid {
+		out, err := g.runGitCommand(g.repoPath, "rev-parse", "--verify", "refs/heads/"+g.branchName)
+		if err != nil {
+			return "", "", fmt.Errorf("failed to find branch %s: %w", g.branchName, err)
 		}
+		head = strings.TrimSpace(out)
+		return head, head, nil
 	}
 
-	for _, entry := range entries {
-		if entry.IsDir() {
-			worktreePath := filepath.Join(worktreesDir, entry.Name())
-
-			// Delete the branch associated with this worktree if found
-			for path, branch := range worktreeBranches {
-				if strings.Contains(path, entry.Name()) {
-					// Delete the branch
-					deleteCmd := exec.Command("git", "branch", "-D", branch)
-					if err := deleteCmd.Run(); err != nil {
-						// Log the error but continue with other worktrees
-						log.ErrorLog.Printf("failed to delete branch %s: %v", branch, err)
-					}
-					break
-				}
-			}
-
-			// Remove the worktree directory
-			os.RemoveAll(worktreePath)
-		}
-	}
-
-	// You have to prune the cleaned up worktrees.
-	cmd = exec.Command("git", "worktree", "prune")
-	_, err = cmd.Output()
+	out, err := g.runGitCommand(g.worktreePath, "rev-parse", "HEAD")
 	if err != nil {
-		return fmt.Errorf("failed to prune worktrees: %w", err)
+		return "", "", fmt.Errorf("failed to find HEAD of %s: %w", g.worktreePath, err)
 	}
+	head = strings.TrimSpace(out)
 
+	// Stage everything into a throwaway index, so the worktree's own index is untouched.
+	index, err := os.CreateTemp("", "claudesquad-snapshot-index")
+	if err != nil {
+		return "", "", err
+	}
+	index.Close()
+	defer os.Remove(index.Name())
+	withIndex := func(args ...string) (string, error) {
+		cmd := exec.Command("git", append([]string{"-C", g.worktreePath}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_INDEX_FILE="+index.Name())
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("git %s failed: %s (%w)", args[0], output, err)
+		}
+		return strings.TrimSpace(string(output)), nil
+	}
+	if _, err := withIndex("read-tree", "HEAD"); err != nil {
+		return "", "", err
+	}
+	if _, err := withIndex("add", "-A"); err != nil {
+		return "", "", err
+	}
+	tree, err := withIndex("write-tree")
+	if err != nil {
+		return "", "", err
+	}
+	snapshot, err = withIndex("-c", "user.name=claude-squad", "-c", "user.email=claude-squad@localhost",
+		"commit-tree", tree, "-p", head, "-m", "claude-squad fork snapshot")
+	if err != nil {
+		return "", "", err
+	}
+	return head, snapshot, nil
+}
+
+// SetupFrom creates the worktree on a new branch at head, with snapshot's files in it as
+// uncommitted changes, so it looks like the worktree Snapshot was taken from. The base
+// commit is kept as given, so diffs show the same changes as there.
+func (g *GitWorktree) SetupFrom(head string, snapshot string) error {
+	_, _ = g.runGitCommand(g.repoPath, "worktree", "remove", "-f", g.worktreePath)
+	_ = os.RemoveAll(g.worktreePath)
+	_, _ = g.runGitCommand(g.repoPath, "branch", "-D", g.branchName)
+
+	if _, err := g.runGitCommand(g.repoPath, "worktree", "add", "-b", g.branchName, g.worktreePath, head); err != nil {
+		return fmt.Errorf("failed to create worktree from commit %s: %w", head, err)
+	}
+	if snapshot == head {
+		return nil
+	}
+	// Check out the snapshot's files, then point the index back at head: the files stay,
+	// as changes on top of head.
+	if _, err := g.runGitCommand(g.worktreePath, "read-tree", "-u", "--reset", snapshot); err != nil {
+		return fmt.Errorf("failed to copy files into %s: %w", g.worktreePath, err)
+	}
+	if _, err := g.runGitCommand(g.worktreePath, "reset", "-q"); err != nil {
+		return fmt.Errorf("failed to reset index of %s: %w", g.worktreePath, err)
+	}
 	return nil
 }

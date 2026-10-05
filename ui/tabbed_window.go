@@ -18,7 +18,9 @@ var (
 	inactiveTabBorder = tabBorderWithBottom("┴", "─", "┴")
 	activeTabBorder   = tabBorderWithBottom("┘", " ", "└")
 	highlightColor    = lipgloss.AdaptiveColor{Light: "#874BFD", Dark: "#7D56F4"}
-	inactiveTabStyle  = lipgloss.NewStyle().
+	// focusColor replaces highlightColor while keys go to the session in the preview.
+	focusColor       = lipgloss.AdaptiveColor{Light: "#D97706", Dark: "#F59E0B"}
+	inactiveTabStyle = lipgloss.NewStyle().
 				Border(inactiveTabBorder, true).
 				BorderForeground(highlightColor).
 				AlignHorizontal(lipgloss.Center)
@@ -54,6 +56,8 @@ type TabbedWindow struct {
 	diff     *DiffPane
 	terminal *TerminalPane
 	instance *session.Instance
+	// focused is true while keys go to the session in the preview; see SetFocused.
+	focused bool
 }
 
 func NewTabbedWindow(preview *PreviewPane, diff *DiffPane, terminal *TerminalPane) *TabbedWindow {
@@ -95,6 +99,17 @@ func (w *TabbedWindow) GetPreviewSize() (width, height int) {
 
 func (w *TabbedWindow) Toggle() {
 	w.activeTab = (w.activeTab + 1) % len(w.tabs)
+}
+
+// SetActiveTab shows the tab with the given index, such as PreviewTab.
+func (w *TabbedWindow) SetActiveTab(tab int) {
+	w.activeTab = tab
+}
+
+// SetFocused marks the window as receiving keys for its session, which draws its border in
+// focusColor.
+func (w *TabbedWindow) SetFocused(focused bool) {
+	w.focused = focused
 }
 
 // UpdatePreview updates the content of the preview pane. instance may be nil.
@@ -238,6 +253,9 @@ func (w *TabbedWindow) String() string {
 		} else {
 			style = inactiveTabStyle
 		}
+		if w.focused {
+			style = style.BorderForeground(focusColor)
+		}
 		border, _, _, _, _ := style.GetBorder()
 		if isFirst && isActive {
 			border.BottomLeft = "│"
@@ -263,7 +281,11 @@ func (w *TabbedWindow) String() string {
 	case TerminalTab:
 		content = w.terminal.String()
 	}
-	window := windowStyle.Render(
+	style := windowStyle
+	if w.focused {
+		style = style.BorderForeground(focusColor)
+	}
+	window := style.Render(
 		lipgloss.Place(
 			w.width, w.height-windowStyle.GetVerticalFrameSize()-tabHeight,
 			lipgloss.Left, lipgloss.Top, content))

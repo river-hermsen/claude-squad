@@ -47,7 +47,7 @@ func newTestWorkspace(t *testing.T, repos ...string) *Workspace {
 
 	w, err := New(root, "my session")
 	require.NoError(t, err)
-	require.NoError(t, w.Setup("/usr/local/bin/cs"))
+	require.NoError(t, w.Setup())
 	return w
 }
 
@@ -342,12 +342,13 @@ func TestRunHookWritesDenyDecision(t *testing.T) {
 func TestClaudeArgsPointAtWorkspaceFiles(t *testing.T) {
 	w := newTestWorkspace(t, "repoA")
 	args := w.ClaudeArgs()
-	require.Contains(t, args, "--settings '"+filepath.Join(w.Dir(), metaDirName, settingsFileName)+"'")
 	require.Contains(t, args, "--add-dir '"+w.Dir()+"'")
+	require.Contains(t, args, "--append-system-prompt-file '"+filepath.Join(w.Dir(), metaDirName, promptFileName)+"'")
+	require.FileExists(t, filepath.Join(w.Dir(), metaDirName, promptFileName))
 
-	data, err := os.ReadFile(filepath.Join(w.Dir(), metaDirName, settingsFileName))
+	hooks, err := json.Marshal(w.Hooks("/usr/local/bin/cs"))
 	require.NoError(t, err)
-	require.Contains(t, string(data), `'/usr/local/bin/cs' hook --workspace '`+w.Dir()+`'`)
+	require.Contains(t, string(hooks), `'/usr/local/bin/cs' hook --workspace '`+w.Dir()+`'`)
 }
 
 // A workspace directory deleted outside claude-squad leaves its worktrees registered in the
@@ -361,9 +362,124 @@ func TestIsolateRecoversFromDeletedWorkspace(t *testing.T) {
 
 	again, err := New(w.Root(), "my session")
 	require.NoError(t, err)
-	require.NoError(t, again.Setup("/usr/local/bin/cs"))
+	require.NoError(t, again.Setup())
 	created, err := again.Isolate("repoA")
 	require.NoError(t, err)
 	require.True(t, created)
 	require.FileExists(t, filepath.Join(again.WorktreePath("repoA"), "README.md"))
+}
+
+// A fork of a multi-repo workspace gets its own worktree of every repository the source
+// changed, with those changes, and a hook that sends edits aimed at the source's worktrees
+// (which the forked conversation remembers) to its own.
+func TestForkCopiesEveryRepoAndRedirectsEditsToSource(t *testing.T) {
+	src := newTestWorkspace(t, "repoA", "repoB", "repoC")
+	for _, repo := range []string{"repoA", "repoB"} {
+		_, err := src.Isolate(repo)
+		require.NoError(t, err)
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(src.WorktreePath("repoA"), "README.md"), []byte("goodbye\n"), 0644))
+	mustGit(t, src.WorktreePath("repoB"), "rm", "-q", "src/app.cs")
+	mustGit(t, src.WorktreePath("repoB"), "commit", "-q", "-m", "drop app")
+
+	fork, err := Fork(src, "my fork")
+	require.NoError(t, err)
+	require.NoError(t, fork.Setup())
+	require.Equal(t, []string{"repoA", "repoB"}, repoNames(t, fork))
+
+	readme, err := os.ReadFile(filepath.Join(fork.WorktreePath("repoA"), "README.md"))
+	require.NoError(t, err)
+	require.Equal(t, "goodbye\n", string(readme), "uncommitted changes are copied")
+	require.NoFileExists(t, filepath.Join(fork.WorktreePath("repoB"), "src", "app.cs"), "commits are copied")
+	require.Equal(t, git.BranchNameFor("my fork"), mustGit(t, fork.WorktreePath("repoA"), "branch", "--show-current"))
+
+	stats := fork.Diff()
+	require.NoError(t, stats.Error)
+	require.Equal(t, []string{"repoA", "repoB"}, stats.RepoNames(), "diffs start where the source's did")
+
+	prompt, err := os.ReadFile(filepath.Join(fork.Dir(), metaDirName, promptFileName))
+	require.NoError(t, err)
+	require.Contains(t, string(prompt), "forked from claude-squad session \"my session\"")
+	require.Contains(t, string(prompt), src.Dir())
+
+	// The forked conversation edits a file in the source's worktree, then in one the fork
+	// has not isolated yet.
+	reason := decide(fork, "Edit", fork.Root(), map[string]any{"file_path": filepath.Join(src.WorktreePath("repoA"), "README.md")})
+	require.Contains(t, reason, "belongs to another claude-squad session")
+	require.Contains(t, reason, filepath.Join(fork.WorktreePath("repoA"), "README.md"))
+
+	require.NoError(t, os.MkdirAll(filepath.Join(filepath.Dir(src.Dir()), "other", "repoC"), 0755))
+	reason = decide(fork, "Write", fork.Root(), map[string]any{"file_path": filepath.Join(filepath.Dir(src.Dir()), "other", "repoC", "x.md")})
+	require.Contains(t, reason, filepath.Join(fork.WorktreePath("repoC"), "x.md"))
+	require.Equal(t, []string{"repoA", "repoB", "repoC"}, repoNames(t, fork))
+
+	require.Empty(t, decide(fork, "Edit", fork.Root(), map[string]any{"file_path": filepath.Join(fork.WorktreePath("repoA"), "README.md")}),
+		"its own worktrees are fine")
+
+	require.NoError(t, fork.Cleanup())
+	require.Equal(t, "goodbye\n", func() string {
+		data, err := os.ReadFile(filepath.Join(src.WorktreePath("repoA"), "README.md"))
+		require.NoError(t, err)
+		return string(data)
+	}(), "cleaning up the fork leaves the source alone")
+}
+
+// Forking a paused session copies its branch, which then holds all its work.
+func TestForkOfPausedWorkspaceCopiesBranch(t *testing.T) {
+	src := newTestWorkspace(t, "repoA")
+	_, err := src.Isolate("repoA")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(src.WorktreePath("repoA"), "README.md"), []byte("paused work\n"), 0644))
+	require.NoError(t, src.Pause("pause"))
+	require.NoDirExists(t, src.WorktreePath("repoA"))
+
+	fork, err := Fork(src, "from paused")
+	require.NoError(t, err)
+	require.NoError(t, fork.Setup())
+	readme, err := os.ReadFile(filepath.Join(fork.WorktreePath("repoA"), "README.md"))
+	require.NoError(t, err)
+	require.Equal(t, "paused work\n", string(readme))
+}
+
+// A renamed session's branch follows the name until a repository has a worktree on it.
+func TestRenameMovesBranchOnlyBeforeFirstWorktree(t *testing.T) {
+	w := newTestWorkspace(t, "repoA")
+	renamed, err := w.Rename("new name")
+	require.NoError(t, err)
+	require.True(t, renamed)
+	require.Equal(t, git.BranchNameFor("new name"), w.BranchName())
+
+	// The hook runs in its own process, from the files on disk.
+	hook, err := Load(w.Dir())
+	require.NoError(t, err)
+	require.Equal(t, git.BranchNameFor("new name"), hook.BranchName())
+	prompt, err := os.ReadFile(filepath.Join(w.Dir(), metaDirName, promptFileName))
+	require.NoError(t, err)
+	require.Contains(t, string(prompt), git.BranchNameFor("new name"))
+
+	_, err = hook.Isolate("repoA")
+	require.NoError(t, err)
+	require.Equal(t, git.BranchNameFor("new name"), mustGit(t, w.WorktreePath("repoA"), "branch", "--show-current"))
+
+	renamed, err = w.Rename("third")
+	require.NoError(t, err)
+	require.False(t, renamed, "the worktree's branch keeps its name")
+	require.Equal(t, git.BranchNameFor("new name"), w.BranchName())
+}
+
+// A Claude Code session that outlives its claude-squad session (a background session, say)
+// must not change files once the worktrees are gone: the hook denies instead of failing,
+// which would let the change through.
+func TestHookDeniesChangesWhenWorkspaceIsGone(t *testing.T) {
+	gone := filepath.Join(t.TempDir(), "deleted-workspace")
+	var out bytes.Buffer
+	edit := `{"tool_name":"Edit","cwd":"/foys-all","tool_input":{"file_path":"/foys-all/repoA/README.md"}}`
+	require.NoError(t, RunHook(gone, strings.NewReader(edit), &out))
+	require.Contains(t, out.String(), `"permissionDecision":"deny"`)
+	require.Contains(t, out.String(), "no longer exists")
+
+	out.Reset()
+	read := `{"tool_name":"Read","cwd":"/foys-all","tool_input":{"file_path":"/foys-all/repoA/README.md"}}`
+	require.NoError(t, RunHook(gone, strings.NewReader(read), &out))
+	require.Empty(t, out.String(), "reading is harmless")
 }

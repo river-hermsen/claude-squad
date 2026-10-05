@@ -12,8 +12,10 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/creack/pty"
@@ -44,6 +46,13 @@ type TmuxSession struct {
 	ptmx *os.File
 	// monitor monitors the tmux pane content and sends signals to the UI when it's status changes
 	monitor *statusMonitor
+	// wantsMouse caches WantsMouse, as of wantsMouseAt.
+	wantsMouse   bool
+	wantsMouseAt time.Time
+	// captureFailed is true if HasUpdated last failed to capture the pane.
+	captureFailed bool
+	// panePID caches PanePID; 0 until known. Start and Restore reset it.
+	panePID atomic.Int64
 
 	// Initialized by Attach
 	// Deinitilaized by Detach
@@ -90,9 +99,87 @@ func newTmuxSession(name string, program string, ptyFactory PtyFactory, cmdExec 
 	}
 }
 
+// WantsMouse reports whether the program in the session takes mouse events, as Claude
+// Code's fullscreen UI does. Scrolling should then go to the program rather than to tmux's
+// scrollback. The answer is cached for a second, since scrolling asks many times a second.
+func (t *TmuxSession) WantsMouse() bool {
+	if time.Since(t.wantsMouseAt) < time.Second {
+		return t.wantsMouse
+	}
+	out, err := t.cmdExec.Output(exec.Command("tmux", "display-message", "-p", "-t", "="+t.sanitizedName+":", "#{mouse_any_flag}"))
+	t.wantsMouse = err == nil && strings.TrimSpace(string(out)) == "1"
+	t.wantsMouseAt = time.Now()
+	return t.wantsMouse
+}
+
+// ScrollWheel sends one mouse wheel step, up or down, at the middle of the pane, the way a
+// terminal reports it to tmux. tmux passes it on to a program that takes mouse events.
+func (t *TmuxSession) ScrollWheel(up bool) error {
+	rows, cols, err := pty.Getsize(t.ptmx)
+	if err != nil || rows == 0 || cols == 0 {
+		rows, cols = 24, 80
+	}
+	button := 65
+	if up {
+		button = 64
+	}
+	_, err = fmt.Fprintf(t.ptmx, "\x1b[<%d;%d;%dM", button, cols/2+1, rows/2+1)
+	return err
+}
+
+// Ended reports whether the session is gone, as when the program in it exits: the last
+// HasUpdated could not capture the pane, and the session does not exist.
+func (t *TmuxSession) Ended() bool {
+	return t.captureFailed && !t.DoesSessionExist()
+}
+
+// PanePID returns the process id of the program running in the session's pane, or 0 if it
+// cannot tell.
+func (t *TmuxSession) PanePID() int {
+	if pid := t.panePID.Load(); pid != 0 {
+		return int(pid)
+	}
+	out, err := t.cmdExec.Output(exec.Command("tmux", "display-message", "-p", "-t", "="+t.sanitizedName+":", "#{pane_pid}"))
+	if err != nil {
+		return 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0
+	}
+	t.panePID.Store(int64(pid))
+	return pid
+}
+
+// SetProgram sets the command a later Start runs.
+func (t *TmuxSession) SetProgram(program string) {
+	t.program = program
+}
+
+// Rename renames the session for an instance now called name. A session that does not
+// exist (its tmux server died) only takes the new name for when it is started again.
+func (t *TmuxSession) Rename(name string) error {
+	newName := toClaudeSquadTmuxName(name)
+	if newName == t.sanitizedName {
+		return nil
+	}
+	if t.cmdExec.Run(exec.Command("tmux", "has-session", "-t="+newName)) == nil {
+		return fmt.Errorf("a tmux session named %s already exists", newName)
+	}
+	if t.DoesSessionExist() {
+		cmd := exec.Command("tmux", "rename-session", "-t="+t.sanitizedName, newName)
+		if err := t.cmdExec.Run(cmd); err != nil {
+			return fmt.Errorf("failed to rename tmux session %s: %w", t.sanitizedName, err)
+		}
+	}
+	t.sanitizedName = newName
+	return nil
+}
+
 // Start creates and starts a new tmux session, then attaches to it. Program is the command to run in
 // the session (ex. claude). workdir is the git worktree directory.
 func (t *TmuxSession) Start(workDir string) error {
+	t.panePID.Store(0)
 	// Check if the session already exists
 	if t.DoesSessionExist() {
 		return fmt.Errorf("tmux session already exists: %s", t.sanitizedName)
@@ -185,6 +272,7 @@ func (t *TmuxSession) CheckAndHandleTrustPrompt() bool {
 
 // Restore attaches to an existing session and restores the window size
 func (t *TmuxSession) Restore() error {
+	t.panePID.Store(0)
 	// attach-session against a missing session still forks a process successfully, so the
 	// PTY start below would report no error while leaving us attached to nothing. Check
 	// first so callers can tell "session is gone" apart from "PTY failed".
@@ -245,6 +333,7 @@ func (t *TmuxSession) SendKeys(keys string) error {
 // the tmux pane has a prompt for aider or claude code.
 func (t *TmuxSession) HasUpdated() (updated bool, hasPrompt bool) {
 	content, err := t.CapturePaneContent()
+	t.captureFailed = err != nil
 	if err != nil {
 		log.ErrorLog.Printf("error capturing pane content in status monitor: %v", err)
 		return false, false

@@ -44,6 +44,9 @@ func CalculateCenterCoordinates(foregroundLines []string, backgroundLines []stri
 
 // PlaceOverlay places fg on top of bg with an optional shadow effect.
 // If center is true, the foreground is centered on the background; otherwise, the provided x and y are used.
+// oscSequence matches an OSC escape sequence, ended by BEL or ST.
+var oscSequence = regexp.MustCompile("\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)")
+
 func PlaceOverlay(
 	x, y int,
 	fg, bg string,
@@ -71,8 +74,13 @@ func PlaceOverlay(
 	simpleColorRegex := regexp.MustCompile(`\x1b\[[0-9]+m`)
 
 	for i, line := range bgLines {
+		// Drop OSC sequences such as the hyperlinks Claude Code puts around file paths. The
+		// width and cutting functions below only know CSI sequences and would count an OSC
+		// sequence's text as visible, pushing a centered overlay off to the right.
+		content := oscSequence.ReplaceAllString(line, "")
+
 		// Replace background color codes with a faded version
-		content := bgColorRegex.ReplaceAllString(line, "\x1b[48;5;236m") // Dark gray background
+		content = bgColorRegex.ReplaceAllString(content, "\x1b[48;5;236m") // Dark gray background
 
 		// Replace foreground color codes with a faded version
 		content = fgColorRegex.ReplaceAllString(content, "\x1b[38;5;240m") // Medium gray foreground
@@ -92,6 +100,8 @@ func PlaceOverlay(
 
 	// Replace the original background with the faded version
 	bgLines = fadedBgLines
+	// Measure again without the OSC sequences.
+	_, bgWidth = getLines(strings.Join(bgLines, "\n"))
 
 	// Determine placement coordinates
 	placeX, placeY := x, y

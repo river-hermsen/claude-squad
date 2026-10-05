@@ -35,7 +35,7 @@ var (
 type TextInputOverlay struct {
 	textarea      textarea.Model
 	Title         string
-	FocusIndex    int // index into focusable stops
+	FocusIndex    int // index into stops()
 	Submitted     bool
 	Canceled      bool
 	OnSubmit      func()
@@ -43,7 +43,37 @@ type TextInputOverlay struct {
 	height        int
 	profilePicker *ProfilePicker
 	branchPicker  *BranchPicker
-	numStops      int // total number of focus stops
+}
+
+// focusStop is a part of the overlay that Tab moves between.
+type focusStop int
+
+const (
+	stopProfile focusStop = iota
+	stopTextarea
+	stopBranch
+	stopEnter
+)
+
+// stops returns the overlay's focus stops in Tab order.
+func (t *TextInputOverlay) stops() []focusStop {
+	var stops []focusStop
+	if t.profilePicker != nil && t.profilePicker.HasMultiple() {
+		stops = append(stops, stopProfile)
+	}
+	stops = append(stops, stopTextarea)
+	if t.branchPicker != nil {
+		stops = append(stops, stopBranch)
+	}
+	return append(stops, stopEnter)
+}
+
+func (t *TextInputOverlay) focusedStop() focusStop {
+	stops := t.stops()
+	if t.FocusIndex < 0 || t.FocusIndex >= len(stops) {
+		return stopTextarea
+	}
+	return stops[t.FocusIndex]
 }
 
 // NewTextInputOverlay creates a new text input overlay with the given title and initial value.
@@ -52,7 +82,6 @@ func NewTextInputOverlay(title string, initialValue string) *TextInputOverlay {
 	return &TextInputOverlay{
 		textarea: ti,
 		Title:    title,
-		numStops: 2, // textarea + enter button
 	}
 }
 
@@ -81,21 +110,13 @@ func newTextInputOverlayWithPickers(title string, initialValue string, profiles 
 		pp = NewProfilePicker(profiles)
 	}
 
-	numStops := 2 // textarea + enter button
-	if bp != nil {
-		numStops++ // branch picker
-	}
-	if pp != nil && pp.HasMultiple() {
-		numStops++ // profile picker
-	}
-
 	overlay := &TextInputOverlay{
 		textarea:      ti,
 		Title:         title,
 		profilePicker: pp,
 		branchPicker:  bp,
-		numStops:      numStops,
 	}
+
 	overlay.updateFocusState()
 	return overlay
 }
@@ -136,31 +157,22 @@ func (t *TextInputOverlay) View() string {
 
 // isProfilePicker returns true if the current focus is on the profile picker.
 func (t *TextInputOverlay) isProfilePicker() bool {
-	return t.profilePicker != nil && t.profilePicker.HasMultiple() && t.FocusIndex == 0
+	return t.focusedStop() == stopProfile
 }
 
 // isTextarea returns true if the current focus is on the textarea.
 func (t *TextInputOverlay) isTextarea() bool {
-	if t.profilePicker != nil && t.profilePicker.HasMultiple() {
-		return t.FocusIndex == 1
-	}
-	return t.FocusIndex == 0
+	return t.focusedStop() == stopTextarea
 }
 
 // isEnterButton returns true if the current focus is on the enter button.
 func (t *TextInputOverlay) isEnterButton() bool {
-	return t.FocusIndex == t.numStops-1
+	return t.focusedStop() == stopEnter
 }
 
 // isBranchPicker returns true if the current focus is on the branch picker.
 func (t *TextInputOverlay) isBranchPicker() bool {
-	if t.branchPicker == nil {
-		return false
-	}
-	if t.profilePicker != nil && t.profilePicker.HasMultiple() {
-		return t.FocusIndex == 2
-	}
-	return t.FocusIndex == 1
+	return t.focusedStop() == stopBranch
 }
 
 // setFocusIndex sets the focus index and syncs focus state.
@@ -195,12 +207,13 @@ func (t *TextInputOverlay) updateFocusState() {
 // HandleKeyPress processes a key press and updates the state accordingly.
 // Returns (shouldClose, branchFilterChanged).
 func (t *TextInputOverlay) HandleKeyPress(msg tea.KeyMsg) (bool, bool) {
+	numStops := len(t.stops())
 	switch msg.Type {
 	case tea.KeyTab:
-		t.setFocusIndex((t.FocusIndex + 1) % t.numStops)
+		t.setFocusIndex((t.FocusIndex + 1) % numStops)
 		return false, false
 	case tea.KeyShiftTab:
-		t.setFocusIndex((t.FocusIndex - 1 + t.numStops) % t.numStops)
+		t.setFocusIndex((t.FocusIndex - 1 + numStops) % numStops)
 		return false, false
 	case tea.KeyEsc:
 		t.Canceled = true
@@ -215,11 +228,11 @@ func (t *TextInputOverlay) HandleKeyPress(msg tea.KeyMsg) (bool, bool) {
 		}
 		if t.isBranchPicker() {
 			// Enter on branch picker = advance to enter button
-			t.setFocusIndex(t.numStops - 1)
+			t.setFocusIndex(numStops - 1)
 			return false, false
 		}
 		if t.isProfilePicker() {
-			// Enter on profile picker = advance to textarea
+			// Enter on the profile picker = advance to the next stop
 			t.setFocusIndex(t.FocusIndex + 1)
 			return false, false
 		}

@@ -2,6 +2,7 @@ package session
 
 import (
 	"claude-squad/log"
+	"claude-squad/session/claudestatus"
 	"claude-squad/session/git"
 	"claude-squad/session/tmux"
 	"claude-squad/session/workspace"
@@ -65,12 +66,26 @@ type Instance struct {
 	started bool
 	// tmuxSession is the tmux session for the instance.
 	tmuxSession *tmux.TmuxSession
-	// gitWorktree is the git worktree for the instance.
-	gitWorktree *git.GitWorktree
-	// workspace holds per-repository worktrees for an instance started in a directory of
-	// git repositories that is not a repository itself. At most one of gitWorktree and
-	// workspace is set; with neither, the instance runs in place in Path.
+	// workspace holds the instance's git worktrees: one for an instance started inside a
+	// git repository, one per changed repository for an instance started in a directory of
+	// repositories. Without one, the instance runs in place in Path.
 	workspace *workspace.Workspace
+	// claudeDir holds the settings claude-squad passes to Claude Code and the status Claude
+	// reports back (see claudestatus), or is "" when the program is not Claude Code.
+	claudeDir string
+	// claudeInfo is the model, effort and context use Claude Code last reported.
+	claudeInfo *claudestatus.Info
+	// launchArgs are extra Claude Code arguments for the first start only: --resume for a
+	// conversation picked when the instance was created, or the conversation a fork continues.
+	launchArgs string
+	// forkOf is the instance this one is a fork of, until Start has copied its work.
+	forkOf *Instance
+	// pendingClaudeName is a name that Rename gave the instance and the running Claude Code
+	// session has not taken yet; see SyncClaudeName.
+	pendingClaudeName string
+	// adoptsClaudeName is true for an instance resuming a conversation picked in Claude Code,
+	// until it has taken that conversation's name as its title; see AdoptClaudeName.
+	adoptsClaudeName bool
 }
 
 // ToInstanceData converts an Instance to its serializable form
@@ -86,18 +101,7 @@ func (i *Instance) ToInstanceData() InstanceData {
 		UpdatedAt: time.Now(),
 		Program:   i.Program,
 		AutoYes:   i.AutoYes,
-	}
-
-	// Only include worktree data if gitWorktree is initialized
-	if i.gitWorktree != nil {
-		data.Worktree = GitWorktreeData{
-			RepoPath:         i.gitWorktree.GetRepoPath(),
-			WorktreePath:     i.gitWorktree.GetWorktreePath(),
-			SessionName:      i.Title,
-			BranchName:       i.gitWorktree.GetBranchName(),
-			BaseCommitSHA:    i.gitWorktree.GetBaseCommitSHA(),
-			IsExistingBranch: i.gitWorktree.IsExistingBranch(),
-		}
+		ClaudeDir: i.claudeDir,
 	}
 
 	if i.workspace != nil {
@@ -105,6 +109,7 @@ func (i *Instance) ToInstanceData() InstanceData {
 			Root:       i.workspace.Root(),
 			Dir:        i.workspace.Dir(),
 			BranchName: i.workspace.BranchName(),
+			SingleRepo: i.workspace.SingleRepo(),
 		}
 	}
 
@@ -134,26 +139,20 @@ func FromInstanceData(data InstanceData) (*Instance, error) {
 		Program:   data.Program,
 	}
 
-	// Instances started outside a git repository have no worktree data.
-	if data.Worktree.RepoPath != "" {
-		instance.gitWorktree = git.NewGitWorktreeFromStorage(
-			data.Worktree.RepoPath,
-			data.Worktree.WorktreePath,
-			data.Worktree.SessionName,
-			data.Worktree.BranchName,
-			data.Worktree.BaseCommitSHA,
-			data.Worktree.IsExistingBranch,
-		)
-		instance.diffStats = &git.DiffStats{
-			Added:   data.DiffStats.Added,
-			Removed: data.DiffStats.Removed,
-			Content: data.DiffStats.Content,
-		}
-	}
 	if data.Workspace != nil {
 		instance.workspace = workspace.FromStorage(
-			data.Workspace.Root, data.Workspace.Dir, data.Title, data.Workspace.BranchName)
+			data.Workspace.Root, data.Workspace.Dir, data.Title, data.Workspace.BranchName, data.Workspace.SingleRepo)
 	}
+	instance.claudeDir = data.ClaudeDir
+	if instance.claudeDir == "" && instance.IsClaude() {
+		// Saved before the directory name was stored: it was the title.
+		dir, err := claudestatus.Dir(instance.Title)
+		if err != nil {
+			return nil, err
+		}
+		instance.claudeDir = dir
+	}
+	instance.claudeInfo = instance.ComputeClaudeInfo()
 
 	if instance.Paused() {
 		instance.started = true
@@ -208,37 +207,210 @@ func (i *Instance) RepoName() (string, error) {
 	if !i.started {
 		return "", fmt.Errorf("cannot get repo name for instance that has not been started")
 	}
-	if i.gitWorktree == nil {
-		return filepath.Base(i.Path), nil
+	if i.workspace != nil && i.workspace.SingleRepo() != "" {
+		return i.workspace.SingleRepo(), nil
 	}
-	return i.gitWorktree.GetRepoName(), nil
-}
-
-// HasWorktree reports whether the instance runs in its own git worktree. Always false
-// before Start.
-func (i *Instance) HasWorktree() bool {
-	return i.gitWorktree != nil
+	return filepath.Base(i.Path), nil
 }
 
 // IsMultiRepo reports whether the instance runs in a directory of git repositories, each
 // of which gets a worktree once the agent changes it. Always false before Start.
 func (i *Instance) IsMultiRepo() bool {
-	return i.workspace != nil
+	return i.workspace != nil && i.workspace.SingleRepo() == ""
 }
 
 // InPlace reports whether the instance runs directly in Path with no git isolation at all:
-// no branch, diff, push or checkout. True before Start.
+// no branch, diff or checkout. True before Start.
 func (i *Instance) InPlace() bool {
-	return i.gitWorktree == nil && i.workspace == nil
+	return i.workspace == nil
 }
 
-// launchProgram returns the command the tmux session runs: the program, plus the arguments
-// that install the workspace's isolation hook for multi-repo instances.
+// IsClaude reports whether the instance runs Claude Code.
+func (i *Instance) IsClaude() bool {
+	return IsClaudeProgram(i.Program)
+}
+
+// IsClaudeProgram reports whether program, a command line, runs Claude Code.
+func IsClaudeProgram(program string) bool {
+	return workspace.SupportsProgram(program)
+}
+
+// launchProgram returns the command the tmux session runs: the program, plus for Claude Code
+// the session name, the settings writeClaudeSettings writes, the workspace's arguments and
+// launchArgs.
 func (i *Instance) launchProgram() string {
-	if i.workspace == nil {
-		return i.Program
+	program := i.Program
+	if i.claudeDir == "" {
+		return program
 	}
-	return i.Program + " " + i.workspace.ClaudeArgs()
+	if !i.adoptsClaudeName {
+		program += " --name " + shellQuote(i.Title)
+	}
+	program += " " + claudestatus.Args(i.claudeDir)
+	if i.workspace != nil {
+		if args := i.workspace.ClaudeArgs(); args != "" {
+			program += " " + args
+		}
+	}
+	if i.launchArgs != "" {
+		program += " " + i.launchArgs
+	}
+	return program
+}
+
+// setClaudeDir gives a new Claude instance its own directory for Claude Code settings.
+func (i *Instance) setClaudeDir() error {
+	i.claudeDir = ""
+	if !i.IsClaude() {
+		return nil
+	}
+	dir, err := claudestatus.NewDir(i.Title)
+	if err != nil {
+		return fmt.Errorf("failed to find the directory for Claude Code settings: %w", err)
+	}
+	i.claudeDir = dir
+	return nil
+}
+
+// ResumeConversation makes Start continue an earlier Claude Code conversation instead of
+// starting a new one: Claude opens its own picker, the way `claude --resume` does. The
+// instance then takes the picked conversation's name; see AdoptClaudeName.
+func (i *Instance) ResumeConversation() {
+	i.launchArgs = "--resume"
+	i.adoptsClaudeName = true
+}
+
+// AdoptsClaudeName reports whether the instance is waiting to take the name of the
+// conversation picked in Claude Code; see ResumeConversation.
+func (i *Instance) AdoptsClaudeName() bool {
+	return i.adoptsClaudeName
+}
+
+// AdoptClaudeName renames the instance to title, made from the name of the conversation
+// picked in Claude Code, which was claudeName. Claude is only told about the title if it
+// had to differ from that name.
+func (i *Instance) AdoptClaudeName(title string, claudeName string) error {
+	i.adoptsClaudeName = false
+	i.launchArgs = ""
+	if err := i.Rename(title); err != nil {
+		return err
+	}
+	if title == claudeName {
+		i.pendingClaudeName = ""
+	}
+	return nil
+}
+
+// NewFork returns a new instance titled title that continues src's Claude Code conversation
+// in a copy of its work: Start copies src's worktrees, with their uncommitted changes, onto
+// a new branch, and runs `claude --resume <conversation> --fork-session` there.
+func NewFork(src *Instance, title string) (*Instance, error) {
+	if !src.started || src.claudeDir == "" {
+		return nil, fmt.Errorf("only a started Claude Code session can be forked")
+	}
+	if src.claudeInfo == nil || src.claudeInfo.SessionID == "" {
+		return nil, fmt.Errorf("session '%s' has no conversation to fork yet: send it a message first", src.Title)
+	}
+	fork, err := NewInstance(InstanceOptions{Title: title, Path: src.Path, Program: src.Program})
+	if err != nil {
+		return nil, err
+	}
+	fork.forkOf = src
+	fork.launchArgs = "--resume " + shellQuote(src.claudeInfo.SessionID) + " --fork-session"
+	return fork, nil
+}
+
+// Rename changes the title of a started instance and renames its tmux session to match.
+// A running Claude Code session takes the new name as soon as it is idle; see
+// SyncClaudeName. The branch follows too, until the session has changed a repository.
+func (i *Instance) Rename(title string) error {
+	if title == "" {
+		return fmt.Errorf("title cannot be empty")
+	}
+	if i.tmuxSession != nil {
+		if err := i.tmuxSession.Rename(title); err != nil {
+			return err
+		}
+	}
+	i.Title = title
+	if i.workspace != nil {
+		// Until the session has changed a repository, its branch can follow the name.
+		if renamed, err := i.workspace.Rename(title); err != nil {
+			log.WarningLog.Printf("could not rename the branch of %s: %v", title, err)
+		} else if renamed {
+			i.Branch = i.workspace.BranchName()
+		}
+	}
+	if i.tmuxSession != nil {
+		// A restarted session starts with the new name.
+		i.tmuxSession.SetProgram(i.launchProgram())
+	}
+	if i.IsClaude() {
+		i.pendingClaudeName = title
+	}
+	return nil
+}
+
+// SessionEnded reports whether the instance's tmux session is gone, as when the program in it
+// exits. Safe to call from a background goroutine after HasUpdated.
+func (i *Instance) SessionEnded() bool {
+	return i.started && i.Status != Paused && i.tmuxSession != nil && i.tmuxSession.Ended()
+}
+
+// SyncClaudeName gives the running Claude Code session the name Rename set, by sending it
+// `/rename <name>`. That only happens while Claude is waiting with an empty prompt, so it
+// never mixes with what the user is typing; until then it reports false and waits for the
+// next call. Call it from the main event loop when the instance is idle.
+func (i *Instance) SyncClaudeName() (bool, error) {
+	if i.pendingClaudeName == "" || !i.started || i.Status == Paused || i.tmuxSession == nil {
+		return false, nil
+	}
+	content, err := i.tmuxSession.CapturePaneContent()
+	if err != nil || !claudePromptIsEmpty(content) {
+		return false, err
+	}
+	name := i.pendingClaudeName
+	i.pendingClaudeName = ""
+	return true, i.SendPrompt("/rename " + name)
+}
+
+// ScrollSession scrolls the program in the session itself, one mouse wheel step up or down,
+// if it takes mouse events, as Claude Code's fullscreen UI does. It reports whether it did;
+// otherwise the session's output is in tmux's scrollback, which the preview scrolls.
+func (i *Instance) ScrollSession(up bool) bool {
+	if !i.started || i.Status == Paused || i.tmuxSession == nil || !i.tmuxSession.WantsMouse() {
+		return false
+	}
+	if err := i.tmuxSession.ScrollWheel(up); err != nil {
+		log.WarningLog.Printf("could not scroll session %s: %v", i.Title, err)
+		return false
+	}
+	return true
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// writeClaudeSettings writes the Claude Code settings launchProgram passes: claude-squad's
+// status line, and in multi-repo instances the workspace's isolation hook. It must run
+// before every start of the tmux session.
+func (i *Instance) writeClaudeSettings() error {
+	if i.claudeDir == "" {
+		return nil
+	}
+	csPath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to find the claude-squad binary for Claude Code settings: %w", err)
+	}
+	var hooks map[string]any
+	if i.IsMultiRepo() {
+		hooks = i.workspace.Hooks(csPath)
+	}
+	if err := claudestatus.WriteSettings(i.claudeDir, csPath, hooks); err != nil {
+		return fmt.Errorf("failed to write Claude Code settings: %w", err)
+	}
+	return nil
 }
 
 func (i *Instance) SetStatus(status Status) {
@@ -257,34 +429,29 @@ func (i *Instance) Start(firstTimeSetup bool) error {
 	}
 
 	if firstTimeSetup {
-		if !git.IsGitRepo(i.Path) {
-			if i.selectedBranch != "" {
-				return fmt.Errorf("cannot start on branch %q: %s is not a git repository", i.selectedBranch, i.Path)
-			}
-			// A directory of repositories gets a worktree per repository the agent changes,
-			// which needs Claude Code's hooks. Anything else runs in place.
-			if workspace.HasRepos(i.Path) && workspace.SupportsProgram(i.Program) {
-				ws, err := workspace.New(i.Path, i.Title)
-				if err != nil {
-					return fmt.Errorf("failed to create workspace: %w", err)
-				}
-				i.workspace = ws
-				i.Branch = ws.BranchName()
-			}
-		} else if i.selectedBranch != "" {
-			gitWorktree, err := git.NewGitWorktreeFromBranch(i.Path, i.selectedBranch, i.Title)
-			if err != nil {
-				return fmt.Errorf("failed to create git worktree from branch: %w", err)
-			}
-			i.gitWorktree = gitWorktree
-			i.Branch = i.selectedBranch
-		} else {
-			gitWorktree, branchName, err := git.NewGitWorktree(i.Path, i.Title)
-			if err != nil {
-				return fmt.Errorf("failed to create git worktree: %w", err)
-			}
-			i.gitWorktree = gitWorktree
-			i.Branch = branchName
+		var ws *workspace.Workspace
+		var err error
+		switch {
+		case i.forkOf != nil && i.forkOf.workspace != nil:
+			ws, err = workspace.Fork(i.forkOf.workspace, i.Title)
+		case git.IsGitRepo(i.Path):
+			ws, err = workspace.NewSingle(i.Path, i.Title, i.selectedBranch)
+		case i.selectedBranch != "":
+			return fmt.Errorf("cannot start on branch %q: %s is not a git repository", i.selectedBranch, i.Path)
+		// A directory of repositories gets a worktree per repository the agent changes,
+		// which needs Claude Code's hooks. Anything else runs in place.
+		case workspace.HasRepos(i.Path) && workspace.SupportsProgram(i.Program):
+			ws, err = workspace.New(i.Path, i.Title)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to create workspace: %w", err)
+		}
+		if ws != nil {
+			i.workspace = ws
+			i.Branch = ws.BranchName()
+		}
+		if err := i.setClaudeDir(); err != nil {
+			return err
 		}
 	}
 
@@ -327,33 +494,24 @@ func (i *Instance) Start(firstTimeSetup bool) error {
 			return setupErr
 		}
 	} else {
-		// Setup git worktree first
-		if i.gitWorktree != nil {
-			if err := i.gitWorktree.Setup(); err != nil {
-				setupErr = fmt.Errorf("failed to setup git worktree: %w", err)
+		// Set up the workspace (and with it any worktree the agent runs in) first
+		if i.workspace != nil {
+			if err := i.workspace.Setup(); err != nil {
+				setupErr = fmt.Errorf("failed to setup workspace: %w", err)
+				if cleanupErr := i.workspace.Cleanup(); cleanupErr != nil {
+					setupErr = fmt.Errorf("%v (cleanup error: %v)", setupErr, cleanupErr)
+				}
 				return setupErr
 			}
 		}
-		if i.workspace != nil {
-			csPath, err := os.Executable()
-			if err != nil {
-				setupErr = fmt.Errorf("failed to find the claude-squad binary for the workspace hook: %w", err)
-				return setupErr
-			}
-			if err := i.workspace.Setup(csPath); err != nil {
-				setupErr = fmt.Errorf("failed to setup workspace: %w", err)
-				return setupErr
-			}
+		if err := i.writeClaudeSettings(); err != nil {
+			setupErr = err
+			return setupErr
 		}
 
 		// Create new session
 		if err := i.tmuxSession.Start(i.GetWorkDir()); err != nil {
-			// Cleanup git worktree if tmux session creation fails
-			if i.gitWorktree != nil {
-				if cleanupErr := i.gitWorktree.Cleanup(); cleanupErr != nil {
-					err = fmt.Errorf("%v (cleanup error: %v)", err, cleanupErr)
-				}
-			}
+			// Cleanup the workspace if tmux session creation fails
 			if i.workspace != nil {
 				if cleanupErr := i.workspace.Cleanup(); cleanupErr != nil {
 					err = fmt.Errorf("%v (cleanup error: %v)", err, cleanupErr)
@@ -362,6 +520,13 @@ func (i *Instance) Start(firstTimeSetup bool) error {
 			setupErr = fmt.Errorf("failed to start new session: %w", err)
 			return setupErr
 		}
+		// launchArgs only apply to this first start; a later restart starts afresh, except
+		// that an instance still waiting for a conversation to be picked opens the picker again.
+		if !i.adoptsClaudeName {
+			i.launchArgs = ""
+		}
+		i.forkOf = nil
+		i.tmuxSession.SetProgram(i.launchProgram())
 	}
 
 	i.SetStatus(Running)
@@ -378,6 +543,13 @@ func (i *Instance) Kill() error {
 
 	var errs []error
 
+	// Claude Code may move the conversation to the background when its tmux session goes, so
+	// find out which conversation it is first.
+	sessionID := i.paneSessionID()
+	if sessionID == "" && i.claudeInfo != nil {
+		sessionID = i.claudeInfo.SessionID
+	}
+
 	// Always try to cleanup both resources, even if one fails
 	// Clean up tmux session first since it's using the git worktree
 	if i.tmuxSession != nil {
@@ -386,15 +558,17 @@ func (i *Instance) Kill() error {
 		}
 	}
 
-	// Then clean up git worktree
-	if i.gitWorktree != nil {
-		if err := i.gitWorktree.Cleanup(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to cleanup git worktree: %w", err))
-		}
-	}
+	// Then clean up the worktrees
 	if i.workspace != nil {
 		if err := i.workspace.Cleanup(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to cleanup workspace: %w", err))
+		}
+	}
+
+	if i.claudeDir != "" {
+		stopBackgroundConversation(i.Program, sessionID, i.Title, i.Path)
+		if err := claudestatus.Remove(i.claudeDir); err != nil {
+			errs = append(errs, fmt.Errorf("failed to remove Claude Code settings: %w", err))
 		}
 	}
 
@@ -421,7 +595,13 @@ func (i *Instance) Preview() (string, error) {
 	if !i.started || i.Status == Paused {
 		return "", nil
 	}
-	return i.tmuxSession.CapturePaneContent()
+	content, err := i.tmuxSession.CapturePaneContent()
+	if err != nil && !i.tmuxSession.DoesSessionExist() {
+		// The program exited, taking its tmux session with it. That is no error: the next
+		// metadata tick pauses the instance.
+		return "", nil
+	}
+	return content, err
 }
 
 func (i *Instance) HasUpdated() (updated bool, hasPrompt bool) {
@@ -477,24 +657,20 @@ func (i *Instance) IsBranchCheckedOut() (bool, error) {
 	if !i.started {
 		return false, fmt.Errorf("cannot check branch of instance that has not been started")
 	}
-	switch {
-	case i.gitWorktree != nil:
-		return i.gitWorktree.IsBranchCheckedOut()
-	case i.workspace != nil:
-		repos, err := i.workspace.CheckedOutRepos()
-		return len(repos) > 0, err
-	default:
+	if i.workspace == nil {
 		return false, nil
 	}
+	repos, err := i.workspace.CheckedOutRepos()
+	return len(repos) > 0, err
 }
 
-// GetWorkDir returns the directory the instance runs in: its worktree, or Path for instances
-// started outside a git repository.
+// GetWorkDir returns the directory the agent runs in: the worktree of a single-repo
+// instance, otherwise Path.
 func (i *Instance) GetWorkDir() string {
-	if i.gitWorktree == nil {
-		return i.Path
+	if i.workspace != nil && i.workspace.SingleRepo() != "" {
+		return i.workspace.WorktreePath(i.workspace.SingleRepo())
 	}
-	return i.gitWorktree.GetWorktreePath()
+	return i.Path
 }
 
 func (i *Instance) Started() bool {
@@ -520,7 +696,8 @@ func (i *Instance) TmuxAlive() bool {
 	return i.tmuxSession.DoesSessionExist()
 }
 
-// Pause stops the tmux session and removes the worktree, preserving the branch
+// Pause commits the changes in every worktree to its branch, removes the worktrees while
+// keeping the branches, and detaches the tmux session.
 func (i *Instance) Pause() error {
 	if !i.started {
 		return fmt.Errorf("cannot pause instance that has not been started")
@@ -531,97 +708,14 @@ func (i *Instance) Pause() error {
 	if i.InPlace() {
 		return fmt.Errorf("cannot check out session '%s': it is not in a git repository", i.Title)
 	}
-	if i.workspace != nil {
-		return i.pauseWorkspace()
-	}
 
-	var errs []error
-
-	// If the worktree is orphaned (path or .git missing), git cannot operate
-	// on it. Skip dirty check and Remove, prune any lingering metadata, then
-	// transition to Paused so the user can recover via Resume.
-	if valid, err := i.gitWorktree.IsValidWorktree(); err != nil {
-		errs = append(errs, fmt.Errorf("failed to validate worktree: %w", err))
-		log.ErrorLog.Print(err)
-	} else if !valid {
-		log.WarningLog.Printf("worktree at %s is orphaned; skipping dirty check and remove",
-			i.gitWorktree.GetWorktreePath())
-		if err := i.tmuxSession.DetachSafely(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to detach tmux session: %w", err))
-			log.ErrorLog.Print(err)
-		}
-		// Drop any leftover directory so a future Resume's `git worktree add` won't conflict.
-		if err := os.RemoveAll(i.gitWorktree.GetWorktreePath()); err != nil {
-			errs = append(errs, fmt.Errorf("failed to remove orphaned worktree directory: %w", err))
-			log.ErrorLog.Print(err)
-		}
-		if err := i.gitWorktree.Prune(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to prune git worktrees: %w", err))
-			log.ErrorLog.Print(err)
-		}
-		i.SetStatus(Paused)
-		_ = clipboard.WriteAll(i.gitWorktree.GetBranchName())
-		return i.combineErrors(errs)
-	}
-
-	// Check if there are any changes to commit
-	if dirty, err := i.gitWorktree.IsDirty(); err != nil {
-		errs = append(errs, fmt.Errorf("failed to check if worktree is dirty: %w", err))
-		log.ErrorLog.Print(err)
-	} else if dirty {
-		// Commit changes locally (without pushing to GitHub)
-		commitMsg := fmt.Sprintf("[claudesquad] update from '%s' on %s (paused)", i.Title, time.Now().Format(time.RFC822))
-		if err := i.gitWorktree.CommitChanges(commitMsg); err != nil {
-			errs = append(errs, fmt.Errorf("failed to commit changes: %w", err))
-			log.ErrorLog.Print(err)
-			// Return early if we can't commit changes to avoid corrupted state
-			return i.combineErrors(errs)
-		}
-	}
-
-	// Detach from tmux session instead of closing to preserve session output
-	if err := i.tmuxSession.DetachSafely(); err != nil {
-		errs = append(errs, fmt.Errorf("failed to detach tmux session: %w", err))
-		log.ErrorLog.Print(err)
-		// Continue with pause process even if detach fails
-	}
-
-	// Check if worktree exists before trying to remove it
-	if _, err := os.Stat(i.gitWorktree.GetWorktreePath()); err == nil {
-		// Remove worktree but keep branch
-		if err := i.gitWorktree.Remove(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to remove git worktree: %w", err))
-			log.ErrorLog.Print(err)
-			return i.combineErrors(errs)
-		}
-
-		// Only prune if remove was successful
-		if err := i.gitWorktree.Prune(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to prune git worktrees: %w", err))
-			log.ErrorLog.Print(err)
-			return i.combineErrors(errs)
-		}
-	}
-
-	i.SetStatus(Paused)
-	_ = clipboard.WriteAll(i.gitWorktree.GetBranchName())
-
-	if err := i.combineErrors(errs); err != nil {
-		log.ErrorLog.Print(err)
-		return err
-	}
-	return nil
-}
-
-// pauseWorkspace is Pause for multi-repo instances: every isolated repository's changes are
-// committed to its session branch and its worktree removed.
-func (i *Instance) pauseWorkspace() error {
 	commitMsg := fmt.Sprintf("[claudesquad] update from '%s' on %s (paused)", i.Title, time.Now().Format(time.RFC822))
 	if err := i.workspace.Pause(commitMsg); err != nil {
 		// Some worktrees may still hold uncommitted work; keep the session running.
 		log.ErrorLog.Print(err)
 		return fmt.Errorf("failed to pause workspace: %w", err)
 	}
+	// Detach from tmux session instead of closing to preserve session output
 	if err := i.tmuxSession.DetachSafely(); err != nil {
 		log.ErrorLog.Print(err)
 		return fmt.Errorf("failed to detach tmux session: %w", err)
@@ -653,31 +747,12 @@ func (i *Instance) Resume() error {
 		}
 	}
 
-	// An instance outside a git repository has nothing on disk to rebuild, only its tmux
-	// session. It can only be paused by its tmux session dying, never by checkout.
-	if i.gitWorktree != nil {
-		// Check if branch is checked out
-		if checked, err := i.gitWorktree.IsBranchCheckedOut(); err != nil {
-			log.ErrorLog.Print(err)
-			return fmt.Errorf("failed to check if branch is checked out: %w", err)
-		} else if checked {
-			return fmt.Errorf("cannot resume: branch is checked out, please switch to a different branch")
-		}
+	// Without a workspace there is nothing on disk to rebuild, only the tmux session: such an
+	// instance can only be paused by its tmux session dying, never by checkout.
 
-		// Setup git worktree. Setup removes and re-adds the worktree from the branch, which
-		// throws away anything uncommitted in it. After a normal Pause the directory is gone
-		// and that is exactly what we want; but an instance paused because its tmux session
-		// died still has its worktree — and the work in it — sitting on disk, so leave it be.
-		if valid, err := i.gitWorktree.IsValidWorktree(); err != nil || !valid {
-			if err != nil {
-				log.WarningLog.Printf("could not validate worktree at %s, recreating it: %v",
-					i.gitWorktree.GetWorktreePath(), err)
-			}
-			if err := i.gitWorktree.Setup(); err != nil {
-				log.ErrorLog.Print(err)
-				return fmt.Errorf("failed to setup git worktree: %w", err)
-			}
-		}
+	if err := i.writeClaudeSettings(); err != nil {
+		log.ErrorLog.Print(err)
+		return err
 	}
 
 	// Check if tmux session still exists from pause, otherwise create new one
@@ -688,13 +763,6 @@ func (i *Instance) Resume() error {
 			// If restore fails, fall back to creating new session
 			if err := i.tmuxSession.Start(i.GetWorkDir()); err != nil {
 				log.ErrorLog.Print(err)
-				// Cleanup git worktree if tmux session creation fails
-				if i.gitWorktree != nil {
-					if cleanupErr := i.gitWorktree.Cleanup(); cleanupErr != nil {
-						err = fmt.Errorf("%v (cleanup error: %v)", err, cleanupErr)
-						log.ErrorLog.Print(err)
-					}
-				}
 				return fmt.Errorf("failed to start new session: %w", err)
 			}
 		}
@@ -702,13 +770,6 @@ func (i *Instance) Resume() error {
 		// Create new tmux session
 		if err := i.tmuxSession.Start(i.GetWorkDir()); err != nil {
 			log.ErrorLog.Print(err)
-			// Cleanup git worktree if tmux session creation fails
-			if i.gitWorktree != nil {
-				if cleanupErr := i.gitWorktree.Cleanup(); cleanupErr != nil {
-					err = fmt.Errorf("%v (cleanup error: %v)", err, cleanupErr)
-					log.ErrorLog.Print(err)
-				}
-			}
 			return fmt.Errorf("failed to start new session: %w", err)
 		}
 	}
@@ -729,21 +790,10 @@ func (i *Instance) UpdateDiffStats() error {
 		return nil
 	}
 
-	if i.workspace != nil {
-		i.diffStats = i.workspace.Diff()
-		return nil
-	}
-
-	stats := i.gitWorktree.Diff()
+	stats := i.workspace.Diff()
 	if stats.Error != nil {
-		if strings.Contains(stats.Error.Error(), "base commit SHA not set") {
-			// Worktree is not fully set up yet, not an error
-			i.diffStats = nil
-			return nil
-		}
 		return fmt.Errorf("failed to get diff stats: %w", stats.Error)
 	}
-
 	i.diffStats = stats
 	return nil
 }
@@ -754,10 +804,7 @@ func (i *Instance) ComputeDiff() *git.DiffStats {
 	if !i.started || i.Status == Paused || i.InPlace() {
 		return nil
 	}
-	if i.workspace != nil {
-		return i.workspace.Diff()
-	}
-	return i.gitWorktree.Diff()
+	return i.workspace.Diff()
 }
 
 // ComputeDiffNumstat runs a lightweight git diff --numstat and returns only the
@@ -768,10 +815,41 @@ func (i *Instance) ComputeDiffNumstat() *git.DiffStats {
 	if !i.started || i.Status == Paused || i.InPlace() {
 		return nil
 	}
-	if i.workspace != nil {
-		return i.workspace.DiffNumstat()
+	return i.workspace.DiffNumstat()
+}
+
+// ComputeClaudeInfo reads what Claude Code last reported about the instance, or nil if it has
+// reported nothing or the program is not Claude Code. Safe to call from a background goroutine.
+func (i *Instance) ComputeClaudeInfo() *claudestatus.Info {
+	if i.claudeDir == "" {
+		return nil
 	}
-	return i.gitWorktree.DiffNumstat()
+	// Background sessions dispatched from this one report to the same status line. Only the
+	// conversation in the tmux pane counts, if Claude Code says which one that is.
+	if id := i.paneSessionID(); id != "" {
+		return claudestatus.ReadSession(i.claudeDir, id)
+	}
+	return claudestatus.Read(i.claudeDir)
+}
+
+// paneSessionID returns the id of the Claude Code conversation running in the instance's tmux
+// pane, or "" if it cannot tell.
+func (i *Instance) paneSessionID() string {
+	if i.tmuxSession == nil {
+		return ""
+	}
+	return claudestatus.SessionIDForPID(i.tmuxSession.PanePID())
+}
+
+// SetClaudeInfo sets what Claude Code last reported. Should be called from the main event
+// loop to avoid data races with View.
+func (i *Instance) SetClaudeInfo(info *claudestatus.Info) {
+	i.claudeInfo = info
+}
+
+// GetClaudeInfo returns the model, effort and context use Claude Code last reported, or nil.
+func (i *Instance) GetClaudeInfo() *claudestatus.Info {
+	return i.claudeInfo
 }
 
 // SetDiffStats sets the diff statistics on the instance. Should be called from

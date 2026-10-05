@@ -387,3 +387,20 @@ func max(a, b int) int {
 	}
 	return b
 }
+
+// The preview shows the session's whole screen: no row given up for an ellipsis, and if the
+// capture is taller than the pane, the bottom rows, where an agent's prompt is.
+func TestPreviewShowsWholeScreen(t *testing.T) {
+	p := NewPreviewPane()
+	p.SetSize(20, 3)
+	p.previewState = previewState{text: "one\ntwo\nthree\n"}
+	out := p.String()
+	require.NotContains(t, out, "...")
+	require.Contains(t, out, "one")
+	require.Contains(t, out, "three", "the last row is not cut off")
+
+	p.previewState = previewState{text: "zero\none\ntwo\nthree\n"}
+	out = p.String()
+	require.NotContains(t, out, "zero")
+	require.Contains(t, out, "three")
+}

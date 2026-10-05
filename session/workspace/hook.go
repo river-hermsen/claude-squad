@@ -32,15 +32,23 @@ type hookDecision struct {
 // when the call must go to a worktree instead, isolates the repository and writes a deny
 // decision explaining where to redo it. Writing nothing lets the call through.
 func RunHook(dir string, in io.Reader, out io.Writer) error {
-	w, err := Load(dir)
-	if err != nil {
-		return err
-	}
 	var input hookInput
 	if err := json.NewDecoder(in).Decode(&input); err != nil {
 		return fmt.Errorf("failed to parse hook input: %w", err)
 	}
-	reason := w.decide(input)
+	var reason string
+	if w, err := Load(dir); err != nil {
+		// The session was killed while this Claude Code process lived on, for example as a
+		// background session. Its worktrees are gone, so nothing may change files any more:
+		// a failing hook would let the change through to the real checkouts.
+		if input.ToolName != "Read" && input.ToolName != "Grep" && input.ToolName != "Glob" {
+			reason = fmt.Sprintf("The claude-squad session this Claude Code session belongs to no longer exists (%v), "+
+				"and neither do the git worktrees it kept changes in. Do not change any files: tell the user to "+
+				"start a new claude-squad session.", err)
+		}
+	} else {
+		reason = w.decide(input)
+	}
 	if reason == "" {
 		return nil
 	}
@@ -68,9 +76,17 @@ func (w *Workspace) decide(in hookInput) string {
 		if path == "" {
 			path = stringField(in.ToolInput, "notebook_path")
 		}
-		repo, rel := w.repoOf(resolvePath(path, in.Cwd))
+		resolved := resolvePath(path, in.Cwd)
+		repo, rel := w.repoOf(resolved)
+		// A fork's conversation remembers the worktrees of the session it was forked from.
+		prefix := ""
 		if repo == "" {
-			return ""
+			other, otherRel, ok := w.inOtherWorkspace(resolved)
+			if !ok {
+				return ""
+			}
+			repo, rel = other, otherRel
+			prefix = fmt.Sprintf("%s belongs to another claude-squad session. ", resolved)
 		}
 		created, err := w.Isolate(repo)
 		if err != nil {
@@ -78,12 +94,12 @@ func (w *Workspace) decide(in hookInput) string {
 		}
 		target := filepath.Join(w.WorktreePath(repo), rel)
 		if created {
-			return fmt.Sprintf("%s is now isolated for this claude-squad session in a git worktree at %s (branch %s). "+
+			return prefix + fmt.Sprintf("%s is now isolated for this claude-squad session in a git worktree at %s (branch %s). "+
 				"This change was not applied. Read %s and make the change there. "+
 				"From now on make every read, edit, build and git command for %s in %s, and never change files under %s.",
 				repo, w.WorktreePath(repo), w.branchName, target, repo, w.WorktreePath(repo), filepath.Join(w.root, repo))
 		}
-		return fmt.Sprintf("%s is isolated for this claude-squad session in %s. This change was not applied: make it in %s instead, "+
+		return prefix + fmt.Sprintf("%s is isolated for this claude-squad session in %s. This change was not applied: make it in %s instead, "+
 			"and never change files under %s.", repo, w.WorktreePath(repo), target, filepath.Join(w.root, repo))
 
 	case "Read", "Grep", "Glob":
@@ -162,6 +178,23 @@ func (w *Workspace) repoOf(path string) (repo string, rel string) {
 		rel = parts[1]
 	}
 	return parts[0], rel
+}
+
+// inOtherWorkspace returns the repository and relative path of a path inside another
+// claude-squad workspace's worktree of one of root's repositories.
+func (w *Workspace) inOtherWorkspace(path string) (repo string, rel string, ok bool) {
+	r, err := filepath.Rel(filepath.Dir(w.dir), path)
+	if err != nil || strings.HasPrefix(r, "..") {
+		return "", "", false
+	}
+	parts := strings.SplitN(r, string(filepath.Separator), 3)
+	if len(parts) < 2 || parts[0] == filepath.Base(w.dir) || !isRepoDir(filepath.Join(w.root, parts[1])) {
+		return "", "", false
+	}
+	if len(parts) == 3 {
+		rel = parts[2]
+	}
+	return parts[1], rel, true
 }
 
 // bashTargets returns the repositories a shell command works in: the one its working
