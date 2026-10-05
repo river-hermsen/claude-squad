@@ -156,6 +156,7 @@ Both detect screens by literal UI strings. Support for a new agent, or a fix aft
 - **Scrolling** (mouse wheel, `shift+↑/↓`, Preview tab): if the pane's program takes mouse events (`#{mouse_any_flag}`, as Claude Code's fullscreen UI does), `ScrollSession` writes SGR wheel events into the tmux client PTY, and tmux passes them to Claude. The transcript is not in tmux's scrollback in that case. Otherwise the preview's own scroll mode reads the scrollback.
   - For `display-message`, target the pane with `-t =<name>:`. `-t=<name>` prints nothing there, although it works for `has-session`.
 - `overlay.PlaceOverlay` strips OSC sequences, such as Claude Code's file hyperlinks, from the faded background. Its reflow-based width functions only know CSI sequences, so a hyperlink would count as wide text and push a centered dialog to the right.
+  - `fadeLine` then rewrites every SGR sequence in the background to one gray (a dark gray background where the line had one). It does not swap selected color codes, because text after a reset, plain bold text and the terminal's default color would otherwise stay bright behind the dialog.
 - cs sets the terminal title to `claude-squad` with OSC 0 at startup and after every detach (`setTerminalTitle`). Bubble Tea's `SetWindowTitle` only sends OSC 2, which macOS Terminal doesn't show on its tab. The bottom menu's `│` groups and highlighted action group come from `Menu.setGroups`, so build options as groups rather than a flat list.
 
 ## Contributing

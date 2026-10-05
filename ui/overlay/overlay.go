@@ -42,11 +42,11 @@ func CalculateCenterCoordinates(foregroundLines []string, backgroundLines []stri
 	return x, y
 }
 
-// PlaceOverlay places fg on top of bg with an optional shadow effect.
-// If center is true, the foreground is centered on the background; otherwise, the provided x and y are used.
 // oscSequence matches an OSC escape sequence, ended by BEL or ST.
 var oscSequence = regexp.MustCompile("\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)")
 
+// PlaceOverlay places fg on top of bg with an optional shadow effect.
+// If center is true, the foreground is centered on the background; otherwise, the provided x and y are used.
 func PlaceOverlay(
 	x, y int,
 	fg, bg string,
@@ -59,43 +59,13 @@ func PlaceOverlay(
 	bgHeight := len(bgLines)
 	fgHeight := len(fgLines)
 
-	// Apply a fade effect to the background by directly modifying each line
-	// Create a new array of background lines with the fade effect applied
+	// Fade the background: every line becomes one gray, whatever colors and attributes it had.
 	fadedBgLines := make([]string, len(bgLines))
-
-	// Compile regular expressions for ANSI color codes
-	// Match background color codes like \x1b[48;2;R;G;Bm or \x1b[48;5;Nm
-	bgColorRegex := regexp.MustCompile(`\x1b\[48;[25];[0-9;]+m`)
-
-	// Match foreground color codes like \x1b[38;2;R;G;Bm or \x1b[38;5;Nm
-	fgColorRegex := regexp.MustCompile(`\x1b\[38;[25];[0-9;]+m`)
-
-	// Match simple color codes like \x1b[31m
-	simpleColorRegex := regexp.MustCompile(`\x1b\[[0-9]+m`)
-
 	for i, line := range bgLines {
 		// Drop OSC sequences such as the hyperlinks Claude Code puts around file paths. The
 		// width and cutting functions below only know CSI sequences and would count an OSC
 		// sequence's text as visible, pushing a centered overlay off to the right.
-		content := oscSequence.ReplaceAllString(line, "")
-
-		// Replace background color codes with a faded version
-		content = bgColorRegex.ReplaceAllString(content, "\x1b[48;5;236m") // Dark gray background
-
-		// Replace foreground color codes with a faded version
-		content = fgColorRegex.ReplaceAllString(content, "\x1b[38;5;240m") // Medium gray foreground
-
-		// Replace simple color codes with a faded version
-		content = simpleColorRegex.ReplaceAllStringFunc(content, func(match string) string {
-			// Skip reset codes
-			if match == "\x1b[0m" {
-				return match
-			}
-			// Replace with dimmed color
-			return "\x1b[38;5;240m" // Medium gray
-		})
-
-		fadedBgLines[i] = content
+		fadedBgLines[i] = fadeLine(oscSequence.ReplaceAllString(line, ""))
 	}
 
 	// Replace the original background with the faded version
