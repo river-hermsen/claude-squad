@@ -84,14 +84,15 @@ func TestStartRestoresInstanceWhenTmuxSessionSurvives(t *testing.T) {
 // fakeTmux stands in for both the PTY factory and the command executor, and tracks whether
 // the session exists, so Start, Restore and Close behave the way they do against real tmux.
 type fakeTmux struct {
-	t        *testing.T
-	alive    bool
-	name     string   // the session's name, from new-session and rename-session
-	sessions []string // every new-session command, in order
-	pty      string   // the file standing in for the latest PTY, which holds what was typed
-	pane     string   // what capture-pane returns
-	mouse    bool     // whether the pane's program takes mouse events
-	panePID  string   // the pane's process id, or "" if tmux cannot tell
+	t         *testing.T
+	alive     bool
+	name      string   // the session's name, from new-session and rename-session
+	sessions  []string // every new-session command, in order
+	pty       string   // the file standing in for the latest PTY, which holds what was typed
+	pane      string   // what capture-pane returns
+	mouse     bool     // whether the pane's program takes mouse events
+	altScreen bool     // whether the pane's program draws on the alternate screen
+	panePID   string   // the pane's process id, or "" if tmux cannot tell
 }
 
 // argAfter returns the argument after flag in cmd, or "".
@@ -147,6 +148,8 @@ func (f *fakeTmux) exec() cmd_test.MockCmdExec {
 				return []byte("1\n"), nil
 			case strings.Contains(cmd.String(), "mouse_any_flag"):
 				return []byte("0\n"), nil
+			case strings.Contains(cmd.String(), "alternate_on") && f.altScreen:
+				return []byte("1\n"), nil
 			case strings.Contains(cmd.String(), "pane_pid") && f.panePID != "":
 				return []byte(f.panePID + "\n"), nil
 			case strings.Contains(cmd.String(), "pane_pid"):
@@ -619,4 +622,38 @@ func TestClaudeInfoComesFromPaneConversation(t *testing.T) {
 	info := instance.ComputeClaudeInfo()
 	require.Equal(t, "pane", info.SessionName)
 	require.Equal(t, 147000, info.ContextUsed)
+}
+
+// Claude Code's fullscreen UI without mouse events, as cs runs it by default, scrolls a page at
+// a time with Page Up and Page Down; its output is not in tmux's scrollback.
+func TestScrollSessionPagesFullscreenClaude(t *testing.T) {
+	instance, fake := newInPlaceInstance(t, "pages")
+	fake.altScreen = true
+	require.True(t, instance.ScrollSession(true))
+	require.True(t, instance.ScrollSession(false))
+	require.Equal(t, "\x1b[5~\x1b[6~", fake.typed())
+
+	other, err := NewInstance(InstanceOptions{Title: "codex", Path: t.TempDir(), Program: "codex"})
+	require.NoError(t, err)
+	otherFake := &fakeTmux{t: t, altScreen: true}
+	other.SetTmuxSession(tmux.NewTmuxSessionWithDeps("codex", "codex", otherFake, otherFake.exec()))
+	require.NoError(t, other.Start(true))
+	require.False(t, other.ScrollSession(true), "only Claude Code is known to page with these keys")
+}
+
+// Claude Code gets the mouse only if cs is set to take it; otherwise its fullscreen UI would
+// copy a selection to a tmux buffer instead of the terminal's clipboard.
+func TestClaudeMouseFollowsSetting(t *testing.T) {
+	defer func(saved bool) { tmux.CaptureMouse = saved }(tmux.CaptureMouse)
+	instance, _ := newInPlaceInstance(t, "mouse")
+
+	tmux.CaptureMouse = false
+	require.True(t, strings.HasPrefix(instance.launchProgram(), "CLAUDE_CODE_DISABLE_MOUSE=1 claude --name 'mouse' "), instance.launchProgram())
+	tmux.CaptureMouse = true
+	require.True(t, strings.HasPrefix(instance.launchProgram(), "claude --name 'mouse' "), instance.launchProgram())
+
+	codex, err := NewInstance(InstanceOptions{Title: "codex", Path: t.TempDir(), Program: "codex"})
+	require.NoError(t, err)
+	tmux.CaptureMouse = false
+	require.Equal(t, "codex", codex.launchProgram())
 }

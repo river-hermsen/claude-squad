@@ -97,11 +97,11 @@ func copyToClipboard(text string, out io.Writer) string {
 		load := exec.Command("tmux", "load-buffer", "-w", "-")
 		load.Stdin = strings.NewReader(text)
 		if err := load.Run(); err == nil {
-			return "Copied to tmux and your terminal's clipboard, if the terminal allows that."
+			return "Sent to your clipboard if your terminal allows that; else select it and ⌘C."
 		}
 	}
 	_, _ = osc52.New(text).WriteTo(out)
-	return "Sent to your terminal's clipboard (OSC 52), if it allows that."
+	return "Sent to your clipboard (OSC 52) if your terminal allows that; else select it and ⌘C."
 }
 
 // writeClipboard copies text to the clipboard of the machine claude-squad runs on. It is a

@@ -119,3 +119,29 @@ func TestRestoreAttachesWhenSessionExists(t *testing.T) {
 	require.Len(t, ptyFactory.cmds, 1)
 	require.Contains(t, ptyFactory.cmds[0].String(), "attach-session")
 }
+
+// Restoring a session sets its mouse option, so sessions started with another setting follow
+// it: off by default, which leaves selection, copy and paste to the terminal.
+func TestRestoreSetsMouseOption(t *testing.T) {
+	defer func(saved bool) { CaptureMouse = saved }(CaptureMouse)
+	var set []string
+	cmdExec := cmd_test.MockCmdExec{
+		RunFunc: func(cmd *exec.Cmd) error {
+			if strings.Contains(cmd.String(), "mouse") {
+				set = append(set, strings.Join(cmd.Args[1:], " "))
+			}
+			return nil
+		},
+		OutputFunc: func(cmd *exec.Cmd) ([]byte, error) { return nil, nil },
+	}
+	session := NewTmuxSessionWithDeps("copy", "claude", NewMockPtyFactory(t), cmdExec)
+
+	CaptureMouse = false
+	require.NoError(t, session.Restore())
+	CaptureMouse = true
+	require.NoError(t, session.Restore())
+	require.Equal(t, []string{
+		"set-option -t claudesquad_copy mouse off",
+		"set-option -t claudesquad_copy mouse on",
+	}, set)
+}

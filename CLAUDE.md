@@ -124,9 +124,27 @@ Remote Control connects a Claude session to a session on claude.ai, so claude.ai
 - `w` on a session without a connection sets `RemoteControl` and queues `/remote-control`. `SyncRemoteControl` sends it on an idle tick with an empty prompt, after `SyncClaudeName` and never in the same tick, and drops it if the session connected meanwhile; sent while connected, it would open the panel instead.
 - Verified against Claude Code 2.1.289: `--resume <id>` with or without `--remote-control` reconnects the same claude.ai session; `--resume <src> --fork-session` gets a new one and leaves the source's alone; `remoteControlAtStartup: true` in `--settings` works too.
 
+### Starting sessions from the Claude app (`app/server.go`, `app/new.go`, `app/skill.go`, fork-specific)
+
+The Claude app can only start a conversation on a machine that runs `claude remote-control` (server mode). Those conversations are headless children of the server (`claude --print --sdk-url … --session-id cse_…`, registry `entrypoint: "sdk-cli"`) with no terminal. If cs kills one, the server marks it failed and does not respawn it. So cs does not take them over: the conversation starts a real cs session with `cs new` instead.
+
+- **Server** (`remoteServer`, config `remote_server`, unset means on): the TUI keeps `claude remote-control --spawn same-dir --no-create-session-in-dir` running for its launch directory, in tmux session `claudesquad-rc_<dir>_<hash>`. It outlives cs.
+  - Server mode refuses flags it cannot pass to its sessions, such as `--settings`, so only the claude binary is used.
+  - The pane is created as a shell, then `remain-on-exit` is set, then `respawn-pane` runs the server. That way a server that exits at once keeps its output. A dead pane is respawned 30 s after the last start.
+  - `check` runs on the metadata tick at most every 2 s. `·✔︎· Ready`/`Connected` means ready; `[y/N]`, `(y/n)` or `Choose [` means it waits for an answer (`tmux attach -t <name>`). The list's title row shows `server` in blue, gray or red.
+- **Skill**: on start, the TUI writes `~/.claude/skills/claude-squad/SKILL.md` (or under `$CLAUDE_CONFIG_DIR`), naming its own binary. It rewrites the file only while it carries cs's marker comment. The skill tells Claude to run `cs new --title … --prompt …` and reply with the printed link.
+- **`cs new`** (`NewSession`) starts an instance like the TUI's `n` in `--path` (default: cwd), with Remote Control on.
+  - It writes the instance to the inbox, `~/.claude-squad/inbox/<hex nanos>.json` (InstanceData, written as `.tmp` and renamed). It cannot add to `state.json`, because a running TUI saves its own list over it.
+  - It waits for Claude's empty prompt (`WaitUntilReady`). It never types into the trust dialog, where Enter means "No, exit".
+  - It sends the task (`SendTask`; a multi-line task goes as one bracketed paste), waits up to 30 s for `bridgeSessionId`, and prints the link.
+  - Titles are unique against `state.json`, the inbox and existing tmux sessions (`session.StoredTitles`, `UniqueTitle`).
+- **Inbox pickup**: the metadata tick reads the inbox, and `adoptInbox` loads each item with `FromInstanceData` (reattaching tmux), appends it to the list and saves. Only then are the files removed.
+  - It waits while an instance is being named or started (`canAdoptInbox`), because the list's last item is that instance. `newHome` drains the inbox on start too.
+- `main` now exits 1 on an error and prints it once (`SilenceErrors`), so `cs new` failures show as failures to the calling Claude.
+
 ### Persistence (`config/`, `session/storage.go`)
 
-- `~/.claude-squad/config.json` → `config.Config` (default program, `auto_yes`, `daemon_poll_interval`, `branch_prefix`, `profiles`, `remote_control`). Created with defaults on first load; `DefaultConfig` resolves the `claude` path via the user's shell.
+- `~/.claude-squad/config.json` → `config.Config` (default program, `auto_yes`, `daemon_poll_interval`, `branch_prefix`, `profiles`, `remote_control`, `remote_server`, `mouse`). Created with defaults on first load; `DefaultConfig` resolves the `claude` path via the user's shell.
 - `~/.claude-squad/state.json` → `config.State`; instances are stored as raw JSON and decoded by `session.Storage`.
 - Only started instances are saved. Adding a persisted field means updating `InstanceData` / `WorkspaceData` **and** both `ToInstanceData` and `FromInstanceData`.
 
@@ -169,7 +187,19 @@ Both detect screens by literal UI strings. Support for a new agent, or a fix aft
   - `Instance.SendKeys` writes those bytes to the tmux client PTY that cs keeps attached.
   - `View` derives the orange window border (`TabbedWindow.SetFocused`) and the menu (`Menu.SetFocusMode`) from `m.state`. Any state change, such as a help screen popping up, therefore ends typing mode cleanly.
   - Esc reaches the session only after tmux's `escape-time`.
-- **Scrolling** (mouse wheel, `shift+↑/↓`, Preview tab): if the pane's program takes mouse events (`#{mouse_any_flag}`, as Claude Code's fullscreen UI does), `ScrollSession` writes SGR wheel events into the tmux client PTY, and tmux passes them to Claude. The transcript is not in tmux's scrollback in that case. Otherwise the preview's own scroll mode reads the scrollback.
+- **Mouse** (config `mouse`, a `*bool`, unset means on; `tmux.CaptureMouse`): cs, tmux and Claude take mouse events, so the wheel scrolls the preview and typing mode.
+  - A plain drag then selects inside Claude's fullscreen UI or tmux, which copy to a tmux buffer, not the Mac's clipboard. macOS Terminal has no OSC 52 at all.
+  - Text for ⌘C is selected with the terminal's own bypass key: Fn+drag in Terminal, Option+drag in iTerm2, Shift+drag in Ghostty. A left click in cs shows that hint (`selectionHint`, at most every 30 s).
+  - `selectionKey` picks the key from `TERM=xterm-ghostty`, `LC_TERMINAL`, or `TERM_PROGRAM`, and lists all three when it can't tell. Over SSH, Terminal and iTerm2 look the same (`xterm-256color`).
+- Over SSH from Ghostty (`TERM=xterm-ghostty`), the host needs Ghostty's terminfo, or the tmux client cs attaches each session with fails ("missing or unsuitable terminal").
+  - It also needs `COLORTERM=truecolor`, which ssh drops: termenv v0.15.2 doesn't know `xterm-ghostty` and renders no colour without it.
+  - Both are host config, not code. On the VM: `~/.terminfo` (ncurses' `ghostty` entry plus an `xterm-ghostty` alias) and `~/.foys-env.sh`.
+  - With `"mouse": false`, the TUI enables no mouse reporting, `Restore` sets each session's tmux `mouse off`, and Claude launches with `CLAUDE_CODE_DISABLE_MOUSE=1`. tmux passes a program's own mouse capture through even with `mouse off`, so the env var is what frees Claude.
+  - `Restore` sets the option on every session, so sessions started under the other setting follow it. Detaching closes tmux's terminal before a capturing program releases the mouse, so with the mouse off, `releaseMouse` turns reporting off at start and after every detach.
+- **Scrolling** (mouse wheel and `shift+↑/↓`, Preview tab and typing mode): Claude's fullscreen transcript is not in tmux's scrollback, so `ScrollSession` scrolls Claude itself.
+  - If the pane takes mouse events (`#{mouse_any_flag}`), it writes SGR wheel events into the tmux client PTY.
+  - Otherwise, for a Claude instance on the alternate screen (`#{alternate_on}`), it writes PgUp/PgDn.
+  - Anything else uses the preview's own scroll mode over the scrollback.
   - For `display-message`, target the pane with `-t =<name>:`. `-t=<name>` prints nothing there, although it works for `has-session`.
 - `overlay.PlaceOverlay` strips OSC sequences, such as Claude Code's file hyperlinks, from the faded background. Its reflow-based width functions only know CSI sequences, so a hyperlink would count as wide text and push a centered dialog to the right.
   - `fadeLine` then rewrites every SGR sequence in the background to one gray (a dark gray background where the line had one). It does not swap selected color codes, because text after a reset, plain bold text and the terminal's default color would otherwise stay bright behind the dialog.

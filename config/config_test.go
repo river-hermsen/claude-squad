@@ -320,3 +320,18 @@ func TestRemoteControlEnabled(t *testing.T) {
 	}
 	assert.True(t, DefaultConfig().RemoteControlEnabled())
 }
+
+// cs takes the mouse unless the config says not to, also in configs from before the option.
+func TestMouseEnabled(t *testing.T) {
+	for content, want := range map[string]bool{
+		`{"default_program": "claude"}`:                 true,
+		`{"default_program": "claude", "mouse": true}`:  true,
+		`{"default_program": "claude", "mouse": false}`: false,
+	} {
+		tempHome := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(tempHome, ".claude-squad"), 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(tempHome, ".claude-squad", ConfigFileName), []byte(content), 0644))
+		t.Setenv("HOME", tempHome)
+		assert.Equal(t, want, LoadConfig().MouseEnabled(), content)
+	}
+}

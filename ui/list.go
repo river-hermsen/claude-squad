@@ -66,7 +66,27 @@ type List struct {
 	autoyes       bool
 	// limits are the account's usage limits Claude Code reported last; nil before any did.
 	limits *claudestatus.Limits
+	// server is the state of the Remote Control server that lets the Claude app start
+	// sessions on this machine.
+	server ServerState
 }
+
+// ServerState is the state of the Remote Control server cs keeps running, which lets the
+// Claude app start a conversation on this machine.
+type ServerState int
+
+const (
+	// ServerOff means cs runs no server.
+	ServerOff ServerState = iota
+	// ServerStarting means the server is starting or connecting.
+	ServerStarting
+	// ServerReady means the Claude app can start conversations here.
+	ServerReady
+	// ServerNeedsInput means the server waits for an answer in its terminal.
+	ServerNeedsInput
+	// ServerDown means the server stopped; cs starts it again.
+	ServerDown
+)
 
 func NewList(spinner *spinner.Model, autoYes bool) *List {
 	return &List{
@@ -370,7 +390,20 @@ func (l *List) String() string {
 		badge = " " + autoYesStyle.Render(autoYesText)
 	}
 	room := titleWidth - lipgloss.Width(title) - lipgloss.Width(badge) - 2
-	right := renderLimits(l.limits, time.Now(), room) + badge
+	// The server's state goes first; the limits get what room is left.
+	server := renderServer(l.server)
+	if lipgloss.Width(server) > room {
+		server = ""
+	}
+	sep := listDescStyle.UnsetPadding().Render(" · ")
+	limits := renderLimits(l.limits, time.Now(), room-lipgloss.Width(server)-lipgloss.Width(sep))
+	right := server + badge
+	switch {
+	case server != "" && limits != "":
+		right = server + sep + limits + badge
+	case limits != "":
+		right = limits + badge
+	}
 	b.WriteString(title)
 	if pad := titleWidth - lipgloss.Width(title) - lipgloss.Width(right); pad > 0 {
 		b.WriteString(strings.Repeat(" ", pad))
@@ -393,6 +426,29 @@ func (l *List) String() string {
 	}
 	return lipgloss.Place(l.width, l.height, lipgloss.Left, lipgloss.Top,
 		lipgloss.NewStyle().PaddingLeft(1).Render(b.String()))
+}
+
+// SetServer sets the state of the Remote Control server shown in the title row.
+func (l *List) SetServer(state ServerState) {
+	l.server = state
+}
+
+// renderServer renders the Remote Control server's state as "server": blue while the
+// Claude app can start conversations here, dimmed while it starts, red when it needs an
+// answer or stopped. It is empty without a server.
+func renderServer(state ServerState) string {
+	var color lipgloss.TerminalColor
+	switch state {
+	case ServerReady:
+		color = remoteOnColor
+	case ServerStarting:
+		color = pausedStyle.GetForeground()
+	case ServerNeedsInput, ServerDown:
+		color = removedLinesStyle.GetForeground()
+	default:
+		return ""
+	}
+	return lipgloss.NewStyle().Foreground(color).Render("server")
 }
 
 // SetLimits sets the account's usage limits shown in the title row.

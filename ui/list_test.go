@@ -215,3 +215,20 @@ func TestRenderRemoteControlBadge(t *testing.T) {
 	require.Contains(t, title(false), "...", "a long title gives way to the badge")
 	require.Contains(t, title(false), "RC ⏸")
 }
+
+// The title row says whether the Claude app can start sessions on this machine.
+func TestListTitleShowsServer(t *testing.T) {
+	l := newTestList()
+	l.SetSize(70, 10)
+	title := func() string { return ansi.Strip(strings.Split(l.String(), "\n")[1]) }
+	require.NotContains(t, title(), "server", "no server")
+
+	l.SetServer(ServerReady)
+	require.Contains(t, title(), "server · 5h – · wk –")
+
+	l.SetSize(26, 10)
+	require.True(t, strings.HasSuffix(strings.TrimRight(title(), " "), "Instances        server"), "the limits give way first: %q", title())
+
+	l.SetSize(16, 10)
+	require.NotContains(t, title(), "server", "no room")
+}

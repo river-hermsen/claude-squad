@@ -7,6 +7,7 @@ import (
 	"claude-squad/session"
 	"claude-squad/session/claudestatus"
 	"claude-squad/session/git"
+	"claude-squad/session/tmux"
 	"claude-squad/ui"
 	"claude-squad/ui/overlay"
 	"context"
@@ -24,16 +25,29 @@ import (
 
 const GlobalInstanceLimit = 10
 
-// Run is the main entrypoint into the application.
-func Run(ctx context.Context, program string, autoYes bool) error {
+// Run is the main entrypoint into the application. With mouse, cs takes mouse events, for wheel
+// scrolling; otherwise the terminal keeps the mouse for its own selection, copy and paste.
+func Run(ctx context.Context, program string, autoYes bool, mouse bool) error {
 	setTerminalTitle()
-	p := tea.NewProgram(
-		newHome(ctx, program, autoYes),
-		tea.WithAltScreen(),
-		tea.WithMouseCellMotion(), // Mouse scroll
-	)
+	opts := []tea.ProgramOption{tea.WithAltScreen()}
+	if mouse {
+		opts = append(opts, tea.WithMouseCellMotion())
+	} else {
+		releaseMouse()
+	}
+	p := tea.NewProgram(newHome(ctx, program, autoYes), opts...)
 	_, err := p.Run()
 	return err
+}
+
+// releaseMouse turns off mouse reporting, which a program in a session that was attached may
+// have left on: detaching closes tmux's terminal under it before it can turn it off. With it
+// on, the terminal's own selection would not work.
+func releaseMouse() {
+	if tmux.CaptureMouse {
+		return
+	}
+	fmt.Fprint(os.Stdout, "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l")
 }
 
 // setTerminalTitle names the terminal window and tab claude-squad. OSC 0 sets both, where
@@ -124,6 +138,13 @@ type home struct {
 
 	// windowHeight is the terminal's height.
 	windowHeight int
+	// selectionHintAt is when selectionHint last showed.
+	selectionHintAt time.Time
+
+	// server is the Remote Control server that lets the Claude app start sessions here, or nil;
+	// serverState is its state as last checked.
+	server      *remoteServer
+	serverState ui.ServerState
 }
 
 func newHome(ctx context.Context, program string, autoYes bool) *home {
@@ -177,6 +198,21 @@ func newHome(ctx context.Context, program string, autoYes bool) *home {
 			instance.AutoYes = true
 		}
 	}
+	// Sessions `cs new` started while no TUI ran.
+	if items, err := session.ReadInbox(); err == nil {
+		h.adoptInbox(items)
+	}
+
+	if appConfig.RemoteServerEnabled() {
+		h.server = newRemoteServer(currentDir, program)
+	}
+	if h.server != nil {
+		if csPath, err := os.Executable(); err == nil {
+			if err := installSkill(csPath); err != nil {
+				log.WarningLog.Printf("could not install the claude-squad skill: %v", err)
+			}
+		}
+	}
 
 	return h
 }
@@ -221,7 +257,7 @@ func (m *home) Init() tea.Cmd {
 			time.Sleep(100 * time.Millisecond)
 			return previewTickMsg{}
 		},
-		tickUpdateMetadataCmd(m.snapshotActiveInstances(), m.list.GetSelectedInstance()),
+		tickUpdateMetadataCmd(m.snapshotActiveInstances(), m.list.GetSelectedInstance(), m.server),
 	)
 }
 
@@ -333,9 +369,19 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				log.ErrorLog.Printf("could not save instances: %v", err)
 			}
 		}
-		cmds = append(cmds, tickUpdateMetadataCmd(m.snapshotActiveInstances(), m.list.GetSelectedInstance()))
+		if m.canAdoptInbox() && m.adoptInbox(msg.inbox) {
+			cmds = append(cmds, tea.WindowSize(), m.instanceChanged())
+		}
+		if m.server != nil {
+			cmds = append(cmds, m.setServerState(msg.serverState, msg.serverProblem))
+		}
+		cmds = append(cmds, tickUpdateMetadataCmd(m.snapshotActiveInstances(), m.list.GetSelectedInstance(), m.server))
 		return m, tea.Batch(cmds...)
 	case tea.MouseMsg:
+		// cs takes the mouse for the wheel, so a plain drag selects nothing; say how to.
+		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+			return m, m.selectionHint()
+		}
 		// Handle mouse wheel events for scrolling the diff/preview pane
 		if msg.Action == tea.MouseActionPress {
 			if msg.Button == tea.MouseButtonWheelDown || msg.Button == tea.MouseButtonWheelUp {
@@ -964,6 +1010,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 				}
 				<-ch
 				setTerminalTitle()
+				releaseMouse()
 				m.state = stateDefault
 			})
 			return m, nil
@@ -977,6 +1024,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			}
 			<-ch
 			setTerminalTitle()
+			releaseMouse()
 			m.state = stateDefault
 			m.instanceChanged()
 		})
@@ -1080,24 +1128,14 @@ func (m *home) uniqueTitle(name string) string {
 // uniqueTitleFor is uniqueTitle for naming self, an instance whose own title does not count
 // as taken.
 func (m *home) uniqueTitleFor(self *session.Instance, name string) string {
-	name = strings.Join(strings.Fields(name), " ")
-	if name == "" {
-		name = "session"
-	}
-	taken := func(title string) bool {
+	return session.UniqueTitle(name, func(title string) bool {
 		for _, inst := range m.list.GetInstances() {
 			if inst != self && inst.Title == title {
 				return true
 			}
 		}
 		return false
-	}
-	title := strings.TrimSpace(runewidth.Truncate(name, 32, ""))
-	for n := 2; taken(title); n++ {
-		suffix := fmt.Sprintf(" %d", n)
-		title = strings.TrimSpace(runewidth.Truncate(name, 32-len(suffix), "")) + suffix
-	}
-	return title
+	})
 }
 
 // adoptClaudeName names inst, which resumed a conversation picked in Claude Code, after
@@ -1240,6 +1278,12 @@ type metadataUpdateDoneMsg struct {
 	results []instanceMetaResult
 	// limits are the account's usage limits Claude Code reported last, or nil.
 	limits *claudestatus.Limits
+	// inbox holds the sessions `cs new` started that the list does not have yet.
+	inbox []session.InboxItem
+	// serverState is the Remote Control server's state, and serverProblem what it printed
+	// last when it needs an answer or stopped.
+	serverState   ui.ServerState
+	serverProblem string
 }
 
 // instanceStartDoneMsg is sent when the background instance start completes.
@@ -1279,13 +1323,17 @@ func (m *home) snapshotActiveInstances() []*session.Instance {
 // Only the selected instance gets a full diff (with Content); the rest get a
 // lightweight numstat-only summary. This keeps per-instance memory bounded
 // since the diff pane only ever renders the selected one.
-func tickUpdateMetadataCmd(active []*session.Instance, selected *session.Instance) tea.Cmd {
+func tickUpdateMetadataCmd(active []*session.Instance, selected *session.Instance, server *remoteServer) tea.Cmd {
 	return func() tea.Msg {
 		time.Sleep(500 * time.Millisecond)
 
-		limits := readLimits()
+		done := metadataUpdateDoneMsg{limits: readLimits()}
+		done.inbox, _ = session.ReadInbox()
+		if server != nil {
+			done.serverState, done.serverProblem = server.check()
+		}
 		if len(active) == 0 {
-			return metadataUpdateDoneMsg{limits: limits}
+			return done
 		}
 
 		results := make([]instanceMetaResult, len(active))
@@ -1309,7 +1357,8 @@ func tickUpdateMetadataCmd(active []*session.Instance, selected *session.Instanc
 		}
 		wg.Wait()
 
-		return metadataUpdateDoneMsg{results: results, limits: limits}
+		done.results = results
+		return done
 	}
 }
 
@@ -1335,6 +1384,16 @@ func (m *home) handleError(err error) tea.Cmd {
 
 		return hideErrMsg{}
 	}
+}
+
+// selectionHint says how to select text for the terminal's copy and paste while cs takes the
+// mouse, at most every half minute.
+func (m *home) selectionHint() tea.Cmd {
+	if time.Since(m.selectionHintAt) < 30*time.Second {
+		return nil
+	}
+	m.selectionHintAt = time.Now()
+	return m.showInfo("To select text for ⌘C, hold " + selectionKey() + " while you drag; ⌘V pastes")
 }
 
 // showInfo shows msg, a notice rather than an error, where errors show, for 3 seconds.

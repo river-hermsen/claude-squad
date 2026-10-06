@@ -419,6 +419,12 @@ func userStatusLine(projectDir string) string {
 	return ""
 }
 
+// ConfigDir returns where Claude Code keeps the user's settings, skills and session registry,
+// or "" if it cannot tell.
+func ConfigDir() string {
+	return claudeConfigDir()
+}
+
 // claudeConfigDir returns where Claude Code keeps the user's settings.
 func claudeConfigDir() string {
 	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {

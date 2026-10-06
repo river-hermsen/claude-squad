@@ -49,6 +49,9 @@ type TmuxSession struct {
 	// wantsMouse caches WantsMouse, as of wantsMouseAt.
 	wantsMouse   bool
 	wantsMouseAt time.Time
+	// alternate caches AlternateScreen, as of alternateAt.
+	alternate   bool
+	alternateAt time.Time
 	// captureFailed is true if HasUpdated last failed to capture the pane.
 	captureFailed bool
 	// panePID caches PanePID; 0 until known. Start and Restore reset it.
@@ -67,6 +70,21 @@ type TmuxSession struct {
 }
 
 const TmuxPrefix = "claudesquad_"
+
+// CaptureMouse is true if sessions take mouse events: tmux's mouse mode is on, and Claude Code
+// handles the mouse in its fullscreen UI. Then the wheel scrolls, and a plain drag selects
+// inside tmux or Claude Code, which copy to a tmux buffer; the terminal's own selection, for
+// its copy and paste, needs a key held while dragging (Fn in macOS Terminal, Option in
+// iTerm2). Otherwise the terminal keeps the mouse. Set it before starting or restoring sessions.
+var CaptureMouse = true
+
+// mouseOption is the value of tmux's mouse option for sessions; see CaptureMouse.
+func mouseOption() string {
+	if CaptureMouse {
+		return "on"
+	}
+	return "off"
+}
 
 // ErrSessionNotFound is returned when the tmux session backing an instance is gone, which
 // happens whenever the tmux server dies (reboot, crash, `tmux kill-server`).
@@ -110,6 +128,29 @@ func (t *TmuxSession) WantsMouse() bool {
 	t.wantsMouse = err == nil && strings.TrimSpace(string(out)) == "1"
 	t.wantsMouseAt = time.Now()
 	return t.wantsMouse
+}
+
+// AlternateScreen reports whether the program in the session draws on the alternate screen, as
+// Claude Code's fullscreen UI does; its output is then not in tmux's scrollback. Cached for a
+// second, like WantsMouse.
+func (t *TmuxSession) AlternateScreen() bool {
+	if time.Since(t.alternateAt) < time.Second {
+		return t.alternate
+	}
+	out, err := t.cmdExec.Output(exec.Command("tmux", "display-message", "-p", "-t", "="+t.sanitizedName+":", "#{alternate_on}"))
+	t.alternate = err == nil && strings.TrimSpace(string(out)) == "1"
+	t.alternateAt = time.Now()
+	return t.alternate
+}
+
+// ScrollPage sends Page Up or Page Down to the program in the session.
+func (t *TmuxSession) ScrollPage(up bool) error {
+	key := "\x1b[6~"
+	if up {
+		key = "\x1b[5~"
+	}
+	_, err := t.ptmx.Write([]byte(key))
+	return err
 }
 
 // ScrollWheel sends one mouse wheel step, up or down, at the middle of the pane, the way a
@@ -226,12 +267,6 @@ func (t *TmuxSession) Start(workDir string) error {
 		log.InfoLog.Printf("Warning: failed to set history-limit for session %s: %v", t.sanitizedName, err)
 	}
 
-	// Enable mouse scrolling for the session
-	mouseCmd := exec.Command("tmux", "set-option", "-t", t.sanitizedName, "mouse", "on")
-	if err := t.cmdExec.Run(mouseCmd); err != nil {
-		log.InfoLog.Printf("Warning: failed to enable mouse scrolling for session %s: %v", t.sanitizedName, err)
-	}
-
 	err = t.Restore()
 	if err != nil {
 		if cleanupErr := t.Close(); cleanupErr != nil {
@@ -278,6 +313,12 @@ func (t *TmuxSession) Restore() error {
 	// first so callers can tell "session is gone" apart from "PTY failed".
 	if !t.DoesSessionExist() {
 		return ErrSessionNotFound
+	}
+
+	// Set on every restore, so sessions started with another setting follow it too.
+	mouseCmd := exec.Command("tmux", "set-option", "-t", t.sanitizedName, "mouse", mouseOption())
+	if err := t.cmdExec.Run(mouseCmd); err != nil {
+		log.InfoLog.Printf("Warning: failed to set the mouse option of session %s: %v", t.sanitizedName, err)
 	}
 
 	ptmx, err := t.ptyFactory.Start(exec.Command("tmux", "attach-session", "-t", t.sanitizedName))

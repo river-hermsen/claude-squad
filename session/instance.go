@@ -276,6 +276,11 @@ func (i *Instance) programWith(args string) string {
 	if i.claudeDir == "" {
 		return program
 	}
+	if !tmux.CaptureMouse {
+		// Claude Code's fullscreen UI would take the mouse, and copy what is dragged over to a
+		// tmux buffer instead of the terminal's clipboard.
+		program = "CLAUDE_CODE_DISABLE_MOUSE=1 " + program
+	}
 	if !i.adoptsClaudeName {
 		program += " --name " + shellQuote(i.Title)
 	}
@@ -421,14 +426,24 @@ func (i *Instance) SyncClaudeName() (bool, error) {
 	return true, i.SendPrompt("/rename " + name)
 }
 
-// ScrollSession scrolls the program in the session itself, one mouse wheel step up or down,
-// if it takes mouse events, as Claude Code's fullscreen UI does. It reports whether it did;
-// otherwise the session's output is in tmux's scrollback, which the preview scrolls.
+// ScrollSession scrolls the program in the session itself, if its output is not in tmux's
+// scrollback: one mouse wheel step up or down for a program that takes mouse events, or a
+// page for Claude Code's fullscreen UI without them. It reports whether it did; otherwise the
+// preview scrolls tmux's scrollback.
 func (i *Instance) ScrollSession(up bool) bool {
-	if !i.started || i.Status == Paused || i.tmuxSession == nil || !i.tmuxSession.WantsMouse() {
+	if !i.started || i.Status == Paused || i.tmuxSession == nil {
 		return false
 	}
-	if err := i.tmuxSession.ScrollWheel(up); err != nil {
+	var err error
+	switch {
+	case i.tmuxSession.WantsMouse():
+		err = i.tmuxSession.ScrollWheel(up)
+	case i.IsClaude() && i.tmuxSession.AlternateScreen():
+		err = i.tmuxSession.ScrollPage(up)
+	default:
+		return false
+	}
+	if err != nil {
 		log.WarningLog.Printf("could not scroll session %s: %v", i.Title, err)
 		return false
 	}
