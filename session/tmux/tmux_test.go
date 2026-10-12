@@ -145,3 +145,31 @@ func TestRestoreSetsMouseOption(t *testing.T) {
 		"set-option -t claudesquad_copy mouse on",
 	}, set)
 }
+
+func TestCursorReadsPanePosition(t *testing.T) {
+	var asked []string
+	out := "2 52 1\n"
+	cmdExec := cmd_test.MockCmdExec{
+		RunFunc: func(cmd *exec.Cmd) error { return nil },
+		OutputFunc: func(cmd *exec.Cmd) ([]byte, error) {
+			asked = append(asked, strings.Join(cmd.Args[1:], " "))
+			return []byte(out), nil
+		},
+	}
+	session := NewTmuxSessionWithDeps("work", "claude", NewMockPtyFactory(t), cmdExec)
+
+	x, y, visible, err := session.Cursor()
+	require.NoError(t, err)
+	require.Equal(t, []int{2, 52}, []int{x, y})
+	require.True(t, visible)
+	require.Equal(t, []string{"display-message -p -t =claudesquad_work: #{cursor_x} #{cursor_y} #{cursor_flag}"}, asked)
+
+	out = "0 0 0\n"
+	_, _, visible, err = session.Cursor()
+	require.NoError(t, err)
+	require.False(t, visible, "the program hid it")
+
+	out = ""
+	_, _, _, err = session.Cursor()
+	require.Error(t, err)
+}

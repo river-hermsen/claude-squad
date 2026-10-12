@@ -44,13 +44,6 @@ type Config struct {
 	BranchPrefix string `json:"branch_prefix"`
 	// Profiles is a list of named program profiles.
 	Profiles []Profile `json:"profiles,omitempty"`
-	// RemoteControl starts new Claude Code sessions with Remote Control on, so claude.ai/code
-	// and the Claude app can continue them. Unset means on; see RemoteControlEnabled.
-	RemoteControl *bool `json:"remote_control,omitempty"`
-	// RemoteServer keeps a Remote Control server (`claude remote-control`) running for the
-	// directory cs runs in, so the Claude app can start a conversation on this machine, which
-	// starts cs sessions with `cs new`. Unset means on; see RemoteServerEnabled.
-	RemoteServer *bool `json:"remote_server,omitempty"`
 	// Mouse lets cs, tmux and Claude Code take mouse events, for wheel scrolling and clicking;
 	// the terminal's own selection then needs a key held while dragging (Fn in Terminal,
 	// Option in iTerm2). Off, the terminal keeps the mouse. Unset means on; see MouseEnabled.
@@ -60,16 +53,6 @@ type Config struct {
 // MouseEnabled reports whether cs, tmux and Claude Code take mouse events.
 func (c *Config) MouseEnabled() bool {
 	return c.Mouse == nil || *c.Mouse
-}
-
-// RemoteControlEnabled reports whether new Claude Code sessions start with Remote Control on.
-func (c *Config) RemoteControlEnabled() bool {
-	return c.RemoteControl == nil || *c.RemoteControl
-}
-
-// RemoteServerEnabled reports whether cs keeps a Remote Control server running.
-func (c *Config) RemoteServerEnabled() bool {
-	return c.RemoteServer == nil || *c.RemoteServer
 }
 
 // GetProgram returns the program to run. If Profiles is non-empty and
@@ -115,13 +98,10 @@ func DefaultConfig() *Config {
 		program = defaultProgram
 	}
 
-	remoteControl := true
 	return &Config{
 		DefaultProgram:     program,
 		AutoYes:            false,
 		DaemonPollInterval: 1000,
-		RemoteControl:      &remoteControl,
-		RemoteServer:       &remoteControl,
 		BranchPrefix: func() string {
 			user, err := user.Current()
 			if err != nil || user == nil || user.Username == "" {

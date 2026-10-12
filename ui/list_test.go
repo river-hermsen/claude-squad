@@ -4,6 +4,7 @@ import (
 	"claude-squad/session"
 	"claude-squad/session/claudestatus"
 	"claude-squad/session/git"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 	"github.com/stretchr/testify/require"
 )
 
@@ -101,7 +103,7 @@ var multiRepoWorkspace = &session.WorkspaceData{Root: "/src/foys-all", Dir: "/ws
 func renderRows(t *testing.T, inst *session.Instance, width int, selected bool, maxRepoRows int) []string {
 	t.Helper()
 	s := spinner.New()
-	r := &InstanceRenderer{spinner: &s}
+	r := &InstanceRenderer{spinner: &s, launchDir: "/src/foys-all"}
 	r.setWidth(width)
 	rows := strings.Split(r.Render(inst, 1, selected, maxRepoRows), "\n")
 	for _, row := range rows {
@@ -152,6 +154,30 @@ func TestRenderSingleRepoAndInPlaceInstances(t *testing.T) {
 	require.Equal(t, "      codex", strings.TrimRight(rows[1], " "), "other agents show their name")
 }
 
+// Sessions in another folder than claude-squad's own name it, as does one being named.
+func TestRenderFolderOutsideLaunchDir(t *testing.T) {
+	elsewhere := &session.WorkspaceData{Root: "/src/other-repos", Dir: "/ws/test-edit", BranchName: "me/test-edit"}
+	inst, err := session.FromInstanceData(session.InstanceData{
+		Title: "test-edit", Path: "/src/other-repos", Program: "claude", Status: session.Paused, Workspace: elsewhere,
+	})
+	require.NoError(t, err)
+	inst.SetDiffStats(&git.DiffStats{Added: 1, Repos: []git.RepoDiff{{Name: "a", Added: 1}}})
+	rows := renderRows(t, inst, 60, false, 10)
+	require.Equal(t, "      other-repos · 1 repo · claude", strings.TrimRight(rows[1], " +1,-0"))
+
+	inPlace, err := session.FromInstanceData(session.InstanceData{
+		Title: "test-edit", Path: "/tmp/notes", Program: "claude", Status: session.Paused,
+	})
+	require.NoError(t, err)
+	rows = renderRows(t, inPlace, 60, false, 10)
+	require.Equal(t, "      notes · claude", strings.TrimRight(rows[1], " "))
+
+	naming, err := session.NewInstance(session.InstanceOptions{Path: "/src/foys-all", Program: "claude"})
+	require.NoError(t, err)
+	rows = renderRows(t, naming, 60, true, 10)
+	require.Equal(t, "      foys-all · claude", strings.TrimRight(rows[1], " "))
+}
+
 func TestRenderCutsInfoToWidth(t *testing.T) {
 	inst := newRenderTestInstance(t, "claude", multiRepoWorkspace)
 	rows := renderRows(t, inst, 30, false, 10)
@@ -191,9 +217,9 @@ func TestListTitleShowsLimits(t *testing.T) {
 	require.True(t, strings.HasSuffix(strings.TrimRight(title, " "), "5h 9% · wk 31%"), "title row: %q", title)
 }
 
-// A Claude session's Remote Control state shows as a badge between the title and the status
-// icon, and the title row keeps its width.
-func TestRenderRemoteControlBadge(t *testing.T) {
+// An instance's title row ends in its status icon and keeps its width, selected or not; a long
+// title gives way.
+func TestRenderInstanceTitleRow(t *testing.T) {
 	inst := newRenderTestInstance(t, "claude", nil)
 	inst.SetStatus(session.Paused)
 	title := func(selected bool) string {
@@ -205,30 +231,93 @@ func TestRenderRemoteControlBadge(t *testing.T) {
 		require.Equal(t, 40, lipgloss.Width(row), "row %q", row)
 		return ansi.Strip(row)
 	}
-	require.NotContains(t, title(false), "RC", "Remote Control is off")
-
-	inst.RemoteControl = true
-	require.True(t, strings.HasSuffix(strings.TrimRight(title(false), " "), "RC ⏸"), title(false))
-	require.True(t, strings.HasSuffix(strings.TrimRight(title(true), " "), "RC ⏸"), "selected: %q", title(true))
+	require.True(t, strings.HasSuffix(strings.TrimRight(title(false), " "), " ⏸"), title(false))
+	require.True(t, strings.HasSuffix(strings.TrimRight(title(true), " "), " ⏸"), "selected: %q", title(true))
 
 	inst.Title = strings.Repeat("long title ", 4)
-	require.Contains(t, title(false), "...", "a long title gives way to the badge")
-	require.Contains(t, title(false), "RC ⏸")
+	require.Contains(t, title(false), "...")
+	require.Contains(t, title(false), " ⏸")
 }
 
-// The title row says whether the Claude app can start sessions on this machine.
-func TestListTitleShowsServer(t *testing.T) {
-	l := newTestList()
-	l.SetSize(70, 10)
-	title := func() string { return ansi.Strip(strings.Split(l.String(), "\n")[1]) }
-	require.NotContains(t, title(), "server", "no server")
+// While keys go to the selected instance it takes the color of the preview's border, and its
+// colored details give way to the row's own color.
+func TestRenderTypingInstance(t *testing.T) {
+	defer lipgloss.SetColorProfile(lipgloss.ColorProfile())
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	inst := newRenderTestInstance(t, "claude", multiRepoWorkspace)
+	inst.SetClaudeInfo(&claudestatus.Info{Model: "Opus 5.5", ContextUsed: 700_000, ContextSize: 1_000_000})
+	render := func(typing, selected bool) string {
+		s := spinner.New()
+		r := &InstanceRenderer{spinner: &s, launchDir: "/src/foys-all", typing: typing}
+		r.setWidth(60)
+		return r.Render(inst, 1, selected, 10)
+	}
+	isFocus := func(out string) bool {
+		return strings.Contains(out, "48;2;245;158;11") || strings.Contains(out, "48;2;217;119;6")
+	}
+	const amber = "38;2;192;13" // contextColor #c08400, with less than half left
 
-	l.SetServer(ServerReady)
-	require.Contains(t, title(), "server · 5h – · wk –")
+	browsing := render(false, true)
+	require.False(t, isFocus(browsing))
+	require.Contains(t, browsing, amber)
 
-	l.SetSize(26, 10)
-	require.True(t, strings.HasSuffix(strings.TrimRight(title(), " "), "Instances        server"), "the limits give way first: %q", title())
+	typing := render(true, true)
+	require.True(t, isFocus(typing), "the focus color: %q", typing)
+	require.NotContains(t, typing, amber, "it would not show on the focus color")
+	require.Equal(t, ansi.Strip(browsing), ansi.Strip(typing), "the same text")
 
-	l.SetSize(16, 10)
-	require.NotContains(t, title(), "server", "no room")
+	require.False(t, isFocus(render(true, false)), "only the selected instance")
+}
+
+// A list taller than its pane scrolls to keep the selected instance in view, moving only when
+// the selection leaves it, and says how many instances are out of view.
+func TestListScrollsToSelected(t *testing.T) {
+	titles := make([]string, 20)
+	for i := range titles {
+		titles[i] = fmt.Sprintf("session-%d", i+1)
+	}
+	l := newTestList(titles...)
+	// 17 rows for instances: 5 of them, and the row saying more follow.
+	l.SetSize(40, 20)
+	view := func() string {
+		t.Helper()
+		out := l.String()
+		require.Equal(t, l.height, lipgloss.Height(out), "the list keeps its height")
+		return ansi.Strip(out)
+	}
+	rows := func() []string { return strings.Split(view(), "\n") }
+
+	out := view()
+	require.Contains(t, out, "session-5")
+	require.NotContains(t, out, "session-6")
+	require.NotContains(t, out, "↑")
+	require.Contains(t, out, "↓ 15 more")
+
+	l.SetSelectedInstance(4)
+	require.Contains(t, view(), "session-1 ", "still in view: no scrolling")
+
+	l.SetSelectedInstance(5)
+	out = view()
+	require.NotContains(t, out, "session-1 ")
+	require.Contains(t, out, "session-6")
+	require.Equal(t, "↑ 1 more", strings.TrimSpace(rows()[2]), "the row under the title")
+	require.Contains(t, out, "↓ 14 more")
+
+	l.SetSelectedInstance(19)
+	out = view()
+	require.Contains(t, out, "↑ 14 more")
+	require.Contains(t, out, "session-15")
+	require.Contains(t, out, "session-20")
+	require.NotContains(t, out, "↓")
+
+	// Moving up inside the window does not scroll.
+	l.SetSelectedInstance(15)
+	require.Contains(t, view(), "↑ 14 more")
+
+	// With room for all of them, the instances above come back.
+	l.SetSize(40, 70)
+	out = view()
+	require.Contains(t, out, "session-1 ")
+	require.NotContains(t, out, "↑")
+	require.NotContains(t, out, "↓")
 }

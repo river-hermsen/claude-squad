@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/require"
 )
 
@@ -403,4 +404,31 @@ func TestPreviewShowsWholeScreen(t *testing.T) {
 	out = p.String()
 	require.NotContains(t, out, "zero")
 	require.Contains(t, out, "three")
+}
+
+// Claude Code's prompt uses the terminal's own cursor, which a capture leaves out; the preview
+// draws it in reverse video, and the text after it keeps its style.
+func TestWithCursor(t *testing.T) {
+	// The prompt row of an idle Claude Code session, its suggestion dimmed.
+	prompt := "\x1b[39m❯ \x1b[2myes commit\x1b[0m"
+	got := withCursor(prompt, 2)
+	require.Equal(t, ansi.Strip(prompt), ansi.Strip(got), "the text stays")
+	require.Contains(t, got, "\x1b[0;7my\x1b[0m")
+	after := got[strings.Index(got, "\x1b[0;7my\x1b[0m")+len("\x1b[0;7my\x1b[0m"):]
+	require.True(t, strings.HasPrefix(after, "\x1b[39m\x1b[2m"), "the suggestion stays dimmed: %q", after)
+
+	require.Equal(t, "$ ls  \x1b[0;7m \x1b[0m", withCursor("$ ls", 6), "past the end of the line")
+	require.Equal(t, "a\x1b[0;7m界\x1b[0mb", withCursor("a界b", 1), "a wide character is covered whole")
+}
+
+func TestPreviewDrawsCursorOnBottomRows(t *testing.T) {
+	p := NewPreviewPane()
+	p.SetSize(20, 2)
+	p.previewState = previewState{text: "zero\none\n> \n", hasCursor: true, cursorX: 2, cursorY: 2}
+	lines := strings.Split(p.String(), "\n")
+	require.Len(t, lines, 2)
+	require.Contains(t, lines[1], "\x1b[0;7m \x1b[0m", "row 2 of the capture is row 1 of the pane")
+
+	p.previewState.hasCursor = false
+	require.NotContains(t, p.String(), "\x1b[0;7m")
 }

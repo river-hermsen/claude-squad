@@ -196,12 +196,6 @@ func TestStartRunsInPlaceOutsideGitRepo(t *testing.T) {
 	require.Nil(t, instance.ComputeDiff())
 	require.Nil(t, instance.ComputeDiffNumstat())
 
-	require.True(t, instance.InPlace())
-	checkedOut, err := instance.IsBranchCheckedOut()
-	require.NoError(t, err)
-	require.False(t, checkedOut)
-	require.Error(t, instance.Pause(), "checkout needs a branch to hand over")
-
 	require.NoError(t, instance.Kill())
 	require.False(t, fake.alive)
 }
@@ -352,9 +346,9 @@ func TestNonClaudeProgramRunsInPlaceInDirectoryOfRepos(t *testing.T) {
 	require.True(t, workspace.HasRepos(root))
 }
 
-// Checkout (pause) commits each isolated repository to its session branch and removes the
-// worktrees; resume brings them back with the changes.
-func TestPauseAndResumeMultiRepoInstance(t *testing.T) {
+// Resume recreates a missing worktree from its session branch, as the old checkout left
+// them: committed to the branch, with the worktree removed.
+func TestResumeRecreatesMissingWorktree(t *testing.T) {
 	root := newRepoDir(t)
 	fake := &fakeTmux{t: t}
 	instance, err := NewInstance(InstanceOptions{Title: "handoff", Path: root, Program: "claude"})
@@ -366,17 +360,20 @@ func TestPauseAndResumeMultiRepoInstance(t *testing.T) {
 	require.NoError(t, err)
 	worktree := instance.workspace.WorktreePath("repoA")
 	require.NoError(t, os.WriteFile(filepath.Join(worktree, "README.md"), []byte("goodbye\n"), 0644))
-
-	require.NoError(t, instance.Pause())
-	require.Equal(t, Paused, instance.Status)
-	require.NoDirExists(t, worktree)
-	out, err := exec.Command("git", "-C", filepath.Join(root, "repoA"), "show", instance.Branch+":README.md").CombinedOutput()
-	require.NoError(t, err, "%s", out)
-	require.Equal(t, "goodbye\n", string(out))
+	for _, args := range [][]string{
+		{"-C", worktree, "commit", "-qam", "work"},
+		{"-C", filepath.Join(root, "repoA"), "worktree", "remove", worktree},
+	} {
+		out, err := exec.Command("git", args...).CombinedOutput()
+		require.NoError(t, err, "%s", out)
+	}
+	instance.SetStatus(Paused)
 
 	require.NoError(t, instance.Resume())
 	require.Equal(t, Running, instance.Status)
-	require.FileExists(t, filepath.Join(worktree, "README.md"))
+	readme, err := os.ReadFile(filepath.Join(worktree, "README.md"))
+	require.NoError(t, err)
+	require.Equal(t, "goodbye\n", string(readme))
 	require.Equal(t, []string{"repoA"}, instance.ComputeDiffNumstat().RepoNames())
 	require.NoError(t, instance.Kill())
 }

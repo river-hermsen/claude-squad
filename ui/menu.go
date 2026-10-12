@@ -61,7 +61,7 @@ type Menu struct {
 }
 
 var defaultMenuGroups = [][]keys.KeyName{{keys.KeyNew, keys.KeyPrompt, keys.KeyResumeClaude}, {keys.KeyHelp, keys.KeyQuit}}
-var newInstanceMenuOptions = []keys.KeyName{keys.KeySubmitName}
+var newInstanceMenuOptions = []keys.KeyName{keys.KeySubmitName, keys.KeyFolder}
 var promptMenuOptions = []keys.KeyName{keys.KeySubmitName}
 
 func NewMenu() *Menu {
@@ -164,37 +164,48 @@ func (m *Menu) addInstanceOptions() {
 		managementGroup = append(managementGroup, keys.KeyFork)
 	}
 
-	// Action group. Checkout needs a git worktree.
+	// Action group.
 	actionGroup := []keys.KeyName{keys.KeyEnter}
 	if m.instance.Status == session.Paused {
 		actionGroup = append(actionGroup, keys.KeyResume)
 	} else {
-		actionGroup = append(actionGroup, keys.KeyFocus)
-		if !m.instance.InPlace() {
-			actionGroup = append(actionGroup, keys.KeyCheckout)
+		if ArrowsSwitchRepos(m.activeTab, m.instance) {
+			actionGroup = append(actionGroup, keys.KeyFocus)
+		} else {
+			actionGroup = append(actionGroup, keys.KeyFocusRight)
 		}
 	}
-	// Remote Control lets claude.ai/code and the Claude app continue a Claude Code session.
-	if m.instance.IsClaude() {
-		actionGroup = append(actionGroup, keys.KeyRemote)
-	}
+	actionGroup = append(actionGroup, keys.KeyEditor)
 
 	// Navigation group
 	var navigationGroup []keys.KeyName
 	if m.activeTab == DiffTab || m.activeTab == TerminalTab {
 		navigationGroup = append(navigationGroup, keys.KeyShiftUp)
 	}
-	if m.activeTab == DiffTab && m.instance.IsMultiRepo() {
-		if stats := m.instance.GetDiffStats(); stats != nil && len(stats.Repos) > 1 {
-			navigationGroup = append(navigationGroup, keys.KeyNextRepo)
-		}
+	if ArrowsSwitchRepos(m.activeTab, m.instance) {
+		navigationGroup = append(navigationGroup, keys.KeyNextRepo)
 	}
 	navigationGroup = append(navigationGroup, keys.KeyTab)
+	if m.activeTab == PreviewTab {
+		// J/K move the selected session in the list; the other tabs need the room.
+		navigationGroup = append(navigationGroup, keys.KeyMoveDown)
+	}
 
 	// System group
 	systemGroup := []keys.KeyName{keys.KeyHelp, keys.KeyQuit}
 
 	m.setGroups(1, managementGroup, actionGroup, navigationGroup, systemGroup)
+}
+
+// ArrowsSwitchRepos reports whether ←/→ switch between the changed repositories of instance,
+// which they do in the diff tab of a multi-repo instance that changed more than one.
+// Otherwise → starts typing into the session.
+func ArrowsSwitchRepos(activeTab int, instance *session.Instance) bool {
+	if activeTab != DiffTab || instance == nil || !instance.IsMultiRepo() {
+		return false
+	}
+	stats := instance.GetDiffStats()
+	return stats != nil && len(stats.Repos) > 1
 }
 
 // SetSize sets the width of the window. The menu will be centered horizontally within this width.
@@ -214,6 +225,18 @@ func (m *Menu) String() string {
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, menuStyle.Render(s.String()))
 	}
 
+	menuText := m.renderOptions(true)
+	if m.width > 0 && lipgloss.Width(menuText) > m.width {
+		// Too wide for the terminal: only the highlighted group keeps its descriptions.
+		menuText = m.renderOptions(false)
+	}
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, menuText)
+}
+
+// renderOptions renders the options, each with its description if withDesc is true; the
+// highlighted group's always have theirs.
+func (m *Menu) renderOptions(withDesc bool) string {
+	var s strings.Builder
 	for i, k := range m.options {
 		binding := keys.GlobalkeyBindings[k]
 
@@ -234,8 +257,10 @@ func (m *Menu) String() string {
 			s.WriteString(localActionStyle.Render(binding.Help().Desc))
 		} else {
 			s.WriteString(localKeyStyle.Render(binding.Help().Key))
-			s.WriteString(" ")
-			s.WriteString(localDescStyle.Render(binding.Help().Desc))
+			if withDesc {
+				s.WriteString(" ")
+				s.WriteString(localDescStyle.Render(binding.Help().Desc))
+			}
 		}
 
 		// Add appropriate separator
@@ -248,6 +273,5 @@ func (m *Menu) String() string {
 		}
 	}
 
-	centeredMenuText := menuStyle.Render(s.String())
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, centeredMenuText)
+	return menuStyle.Render(s.String())
 }

@@ -473,47 +473,6 @@ func (t *TmuxSession) Attach() (chan struct{}, error) {
 	return t.attachCh, nil
 }
 
-// DetachSafely disconnects from the current tmux session without panicking
-func (t *TmuxSession) DetachSafely() error {
-	// Only detach if we're actually attached
-	if t.attachCh == nil {
-		return nil // Already detached
-	}
-
-	var errs []error
-
-	// Close the attached pty session.
-	if t.ptmx != nil {
-		if err := t.ptmx.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("error closing attach pty session: %w", err))
-		}
-		t.ptmx = nil
-	}
-
-	// Clean up attach state
-	if t.attachCh != nil {
-		close(t.attachCh)
-		t.attachCh = nil
-	}
-
-	if t.cancel != nil {
-		t.cancel()
-		t.cancel = nil
-	}
-
-	if t.wg != nil {
-		t.wg.Wait()
-		t.wg = nil
-	}
-
-	t.ctx = nil
-
-	if len(errs) > 0 {
-		return fmt.Errorf("errors during detach: %v", errs)
-	}
-	return nil
-}
-
 // Detach disconnects from the current tmux session. It panics if detaching fails. At the moment, there's no
 // way to recover from a failed detach.
 func (t *TmuxSession) Detach() {
@@ -611,6 +570,32 @@ func (t *TmuxSession) CapturePaneContent() (string, error) {
 		return "", fmt.Errorf("error capturing pane content: %v", err)
 	}
 	return string(output), nil
+}
+
+// CaptureScreen captures what the pane shows, one line per row of the pane. Unlike
+// CapturePaneContent it does not join wrapped lines, so the row Cursor reports is a line.
+func (t *TmuxSession) CaptureScreen() (string, error) {
+	cmd := exec.Command("tmux", "capture-pane", "-p", "-e", "-t", "="+t.sanitizedName+":")
+	output, err := t.cmdExec.Output(cmd)
+	if err != nil {
+		return "", fmt.Errorf("error capturing pane content: %v", err)
+	}
+	return string(output), nil
+}
+
+// Cursor returns where the pane's cursor is, in cells from its top left corner, and whether
+// the program in it shows it. A capture of the pane does not include the cursor.
+func (t *TmuxSession) Cursor() (x, y int, visible bool, err error) {
+	out, err := t.cmdExec.Output(exec.Command("tmux", "display-message", "-p", "-t", "="+t.sanitizedName+":",
+		"#{cursor_x} #{cursor_y} #{cursor_flag}"))
+	if err != nil {
+		return 0, 0, false, err
+	}
+	var flag int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "%d %d %d", &x, &y, &flag); err != nil {
+		return 0, 0, false, fmt.Errorf("could not read the cursor of %s: %q", t.sanitizedName, out)
+	}
+	return x, y, flag == 1, nil
 }
 
 // CapturePaneContentWithOptions captures the pane content with additional options

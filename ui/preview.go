@@ -7,6 +7,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 var previewPaneStyle = lipgloss.NewStyle().
@@ -26,6 +27,9 @@ type previewState struct {
 	fallback bool
 	// text is the text displayed in the preview pane
 	text string
+	// hasCursor is true if the session shows its cursor, at column cursorX of line cursorY.
+	hasCursor        bool
+	cursorX, cursorY int
 }
 
 func NewPreviewPane() *PreviewPane {
@@ -58,38 +62,8 @@ func (p *PreviewPane) UpdateContent(instance *session.Instance) error {
 	case instance.Status == session.Loading:
 		p.setFallbackState("Setting up workspace...")
 		return nil
-	case instance.Status == session.Paused && instance.InPlace():
-		p.setFallbackState("Session is paused. Press 'r' to resume.")
-		return nil
-	case instance.Status == session.Paused && instance.IsMultiRepo():
-		p.setFallbackState(lipgloss.JoinVertical(lipgloss.Center,
-			"Session is paused. Press 'r' to resume.",
-			"",
-			lipgloss.NewStyle().
-				Foreground(lipgloss.AdaptiveColor{
-					Light: "#FFD700",
-					Dark:  "#FFD700",
-				}).
-				Render(fmt.Sprintf(
-					"Each changed repository can be checked out at '%s' (copied to your clipboard)",
-					instance.Branch,
-				)),
-		))
-		return nil
 	case instance.Status == session.Paused:
-		p.setFallbackState(lipgloss.JoinVertical(lipgloss.Center,
-			"Session is paused. Press 'r' to resume.",
-			"",
-			lipgloss.NewStyle().
-				Foreground(lipgloss.AdaptiveColor{
-					Light: "#FFD700",
-					Dark:  "#FFD700",
-				}).
-				Render(fmt.Sprintf(
-					"The instance can be checked out at '%s' (copied to your clipboard)",
-					instance.Branch,
-				)),
-		))
+		p.setFallbackState("Session is paused. Press 'r' to resume.")
 		return nil
 	}
 
@@ -127,6 +101,7 @@ func (p *PreviewPane) UpdateContent(instance *session.Instance) error {
 				fallback: false,
 				text:     content,
 			}
+			p.previewState.cursorX, p.previewState.cursorY, p.previewState.hasCursor = instance.PreviewCursor()
 		}
 	}
 
@@ -179,18 +154,43 @@ func (p *PreviewPane) String() string {
 
 	// Normal mode display: the session's screen, which is sized to fill the pane.
 	lines := strings.Split(strings.TrimSuffix(p.previewState.text, "\n"), "\n")
+	cursorY := p.previewState.cursorY
 	if p.height > 0 {
 		if len(lines) > p.height {
 			// Keep the bottom, where an agent's prompt is.
+			cursorY -= len(lines) - p.height
 			lines = lines[len(lines)-p.height:]
 		} else {
 			lines = append(lines, make([]string, p.height-len(lines))...)
 		}
 	}
+	if p.previewState.hasCursor && cursorY >= 0 && cursorY < len(lines) && p.previewState.cursorX < p.width {
+		lines[cursorY] = withCursor(lines[cursorY], p.previewState.cursorX)
+	}
 
 	content := strings.Join(lines, "\n")
 	rendered := previewPaneStyle.Width(p.width).Render(content)
 	return rendered
+}
+
+// withCursor draws a block cursor, in reverse video, on the cell at column x of line, which
+// may hold escape sequences. The text after it keeps its style.
+func withCursor(line string, x int) string {
+	const block = "\x1b[0;7m%s\x1b[0m"
+	width := ansi.StringWidth(line)
+	if x >= width {
+		return line + strings.Repeat(" ", x-width) + fmt.Sprintf(block, " ")
+	}
+	// A wide character takes two columns; the cursor covers it whole.
+	end := x + 1
+	cell := ansi.Strip(ansi.Cut(line, x, end))
+	if cell == "" {
+		end = x + 2
+		cell = ansi.Strip(ansi.Cut(line, x, end))
+	}
+	// Truncate keeps every escape sequence of the line, and TruncateLeft those of the part it
+	// drops, so the text after the cursor starts in the style it had.
+	return ansi.Truncate(line, x, "") + fmt.Sprintf(block, cell) + ansi.TruncateLeft(line, end, "")
 }
 
 // ScrollUp scrolls up in the viewport

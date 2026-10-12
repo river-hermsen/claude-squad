@@ -238,9 +238,6 @@ func readInfo(path string) *Info {
 type Process struct {
 	// SessionID is the id of the conversation the process runs, which `--resume` takes.
 	SessionID string `json:"sessionId"`
-	// RemoteSessionID is the claude.ai session that Remote Control connects the conversation
-	// to, or "" while Remote Control is off. Claude Code sets it to null on disconnect.
-	RemoteSessionID string `json:"bridgeSessionId"`
 }
 
 // ReadProcess returns the registry entry of the Claude Code process pid, or nil if there is
@@ -268,12 +265,6 @@ func SessionIDForPID(pid int) string {
 		return p.SessionID
 	}
 	return ""
-}
-
-// RemoteURL returns the address of the Remote Control session remoteSessionID, where
-// claude.ai/code and the Claude app continue it.
-func RemoteURL(remoteSessionID string) string {
-	return "https://claude.ai/code/" + remoteSessionID
 }
 
 // HasTranscript reports whether Claude Code saved the conversation sessionID, which it does

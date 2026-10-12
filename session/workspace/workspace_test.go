@@ -250,15 +250,22 @@ func TestDiffCombinesChangedRepositories(t *testing.T) {
 	require.Equal(t, []string{"repoA", "repoB"}, w.DiffNumstat().RepoNames())
 }
 
-func TestPauseKeepsBranchesAndResumeRestoresWorktrees(t *testing.T) {
+// removeWorktree commits content as repo's README.md on the session branch and removes the
+// worktree, keeping the branch, as claude-squad's old checkout did.
+func removeWorktree(t *testing.T, w *Workspace, repo string, content string) {
+	t.Helper()
+	worktree := w.WorktreePath(repo)
+	require.NoError(t, os.WriteFile(filepath.Join(worktree, "README.md"), []byte(content), 0644))
+	mustGit(t, worktree, "commit", "-qam", "work")
+	mustGit(t, filepath.Join(w.Root(), repo), "worktree", "remove", worktree)
+	require.NoDirExists(t, worktree)
+}
+
+func TestResumeRestoresMissingWorktrees(t *testing.T) {
 	w := newTestWorkspace(t, "repoA")
 	_, err := w.Isolate("repoA")
 	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(filepath.Join(w.WorktreePath("repoA"), "README.md"), []byte("goodbye\n"), 0644))
-
-	require.NoError(t, w.Pause("pause"))
-	require.NoDirExists(t, w.WorktreePath("repoA"))
-	require.Equal(t, "goodbye", mustGit(t, filepath.Join(w.Root(), "repoA"), "show", w.BranchName()+":README.md"))
+	removeWorktree(t, w, "repoA", "goodbye\n")
 
 	require.NoError(t, w.Resume())
 	require.FileExists(t, filepath.Join(w.WorktreePath("repoA"), "README.md"))
@@ -424,14 +431,12 @@ func TestForkCopiesEveryRepoAndRedirectsEditsToSource(t *testing.T) {
 	}(), "cleaning up the fork leaves the source alone")
 }
 
-// Forking a paused session copies its branch, which then holds all its work.
-func TestForkOfPausedWorkspaceCopiesBranch(t *testing.T) {
+// Forking a session whose worktree is gone copies its branch, which then holds all its work.
+func TestForkOfWorkspaceWithoutWorktreeCopiesBranch(t *testing.T) {
 	src := newTestWorkspace(t, "repoA")
 	_, err := src.Isolate("repoA")
 	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(filepath.Join(src.WorktreePath("repoA"), "README.md"), []byte("paused work\n"), 0644))
-	require.NoError(t, src.Pause("pause"))
-	require.NoDirExists(t, src.WorktreePath("repoA"))
+	removeWorktree(t, src, "repoA", "paused work\n")
 
 	fork, err := Fork(src, "from paused")
 	require.NoError(t, err)
@@ -482,4 +487,28 @@ func TestHookDeniesChangesWhenWorkspaceIsGone(t *testing.T) {
 	read := `{"tool_name":"Read","cwd":"/foys-all","tool_input":{"file_path":"/foys-all/repoA/README.md"}}`
 	require.NoError(t, RunHook(gone, strings.NewReader(read), &out))
 	require.Empty(t, out.String(), "reading is harmless")
+}
+
+// A single-repo session that continues a conversation gets instructions to use its worktree:
+// earlier messages may name files in the repository's main checkout. Others get none.
+func TestContinuingConversationInWorktreeGetsInstructions(t *testing.T) {
+	root := newTestWorkspace(t, "repoA").Root()
+	repo := filepath.Join(root, "repoA")
+
+	plain, err := NewSingle(repo, "plain", "")
+	require.NoError(t, err)
+	require.NoError(t, plain.Setup())
+	require.Empty(t, plain.ClaudeArgs())
+	require.NoError(t, plain.Cleanup())
+
+	cont, err := NewSingle(repo, "continued", "")
+	require.NoError(t, err)
+	cont.ContinueConversation()
+	require.NoError(t, cont.Setup())
+	prompt := filepath.Join(cont.Dir(), metaDirName, promptFileName)
+	require.Equal(t, "--append-system-prompt-file '"+prompt+"'", cont.ClaudeArgs())
+	text, err := os.ReadFile(prompt)
+	require.NoError(t, err)
+	require.Contains(t, string(text), "never change files in "+repo)
+	require.Contains(t, string(text), "Use the same paths under "+cont.WorktreePath("repoA"))
 }

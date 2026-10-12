@@ -16,7 +16,7 @@ gofmt -l .                             # CI fails if this prints anything; fix w
 
 - Some tests shell out to real `tmux` and `git` (e.g. `ui/preview_test.go`, `session/git/worktree_ops_test.go`), so both must be on PATH.
 - CI lint also runs golangci-lint v1.60.1 with `--fast` and `only-new-issues`.
-- Logs go to `$TMPDIR/claudesquad.log` (path is printed on exit).
+- Logs go to `$TMPDIR/claudesquad.log` (path is printed on exit). `main` exits 1 on an error and prints it once (`SilenceErrors`).
 - To drive the real TUI, run it in a detached tmux session and use `send-keys` / `capture-pane`. Set `HOME` *inside* the command (`tmux new-session -d ... "env HOME=<scratch> ./cs -p bash"`). New tmux sessions take the tmux server's environment, not the calling shell's, so an exported `HOME` is ignored and `cs` reads and writes the real `~/.claude-squad`.
   - The agent sessions `cs` starts get the server's environment too. So a real `claude` there stays logged in, while `cs` itself uses the scratch `HOME`. That makes end-to-end tests with real Claude (`-p "<abs path>/claude --model haiku --permission-mode acceptEdits --allowedTools Bash,Edit,Write,Read,Grep,Glob"`) cheap and safe in a scratch directory of repos.
 - `cs debug` prints the config path and contents; `cs reset` wipes stored instances, `claudesquad_*` tmux sessions, workspaces and `~/.claude-squad/sessions`.
@@ -49,24 +49,28 @@ All git isolation goes through a `Workspace` in `~/.claude-squad/workspaces/<bra
   - Claude sessions are launched with `--name <title>`. After a rename, `SyncClaudeName` (run on idle metadata ticks) sends `/rename <title>`. It waits until `claudePromptIsEmpty` sees the prompt box empty: a `❯` line between two `─` rules that holds only blanks or the dimmed placeholder. That way the command never lands in the middle of a draft.
   - The workspace directory and the Claude settings directory keep their original names. A running Claude still uses them, so the settings directory is stored as `InstanceData.ClaudeDir` rather than derived from the title.
   - The branch follows the new name (`Workspace.Rename`) only while no repository has a worktree. Hook processes see that through `isolate`, which re-reads `workspace.json` under the lock.
-- **`Start(true)`** (new instance) picks a mode from the launch directory. Gate on `InPlace()` / `IsMultiRepo()` and use `GetWorkDir()` / `IsBranchCheckedOut()` rather than reaching into `workspace`. `home.inGitRepo` (from the launch directory) decides whether the branch picker and `git fetch` run.
+- **`Start(true)`** (new instance) picks a mode from the instance's `Path`. Gate on `InPlace()` / `IsMultiRepo()` and use `GetWorkDir()` / `EditorDir()` rather than reaching into `workspace`. Whether `Path` is in a git repo decides whether the branch picker and `git fetch` run.
+  - `Path` is the launch directory (`home.launchDir`) unless another folder is picked: `tab` while naming (`stateNew`) opens `overlay.FolderPicker` (`stateFolder`, `app/folder.go`, `askFolder` with pick/cancel callbacks), which calls `SetPath` (before `Start` only). The picker resolves relative paths against the launch directory and offers the folders of the listed instances first. The list shows the folder's name for in-place and multi-repo sessions outside the launch directory (`List.SetLaunchDir`).
   - **Single-repo** (launched inside a git repo, any agent): `workspace.NewSingle` isolates that repo up front in `<workspace>/<repo>`, on a new `<prefix><title>` branch or the branch picked in the picker (`Repo.ExistingBranch`, kept on cleanup). The agent runs inside that worktree, without a hook.
   - **Multi-repo** (fork-specific): the directory directly contains git repos (like `~/Projects/FOYS/foys-all`) and the program is Claude Code (`workspace.SupportsProgram`). See the workspace section below.
-  - **In place**: anything else, including non-Claude agents in a directory of repos. tmux runs directly in `Path`, with no branch, diff or checkout (`c`). Several such sessions in one directory share it with no isolation.
+  - **In place**: anything else, including non-Claude agents in a directory of repos. tmux runs directly in `Path`, with no branch or diff. Several such sessions in one directory share it with no isolation.
 - **`Start(false)`** (loaded from disk): reattaches to the existing tmux session. If the session is gone (`tmux.ErrSessionNotFound`), the instance is parked as `Paused` instead of erroring — `Storage.LoadInstances` aborts on the first error, so one dead session would hide all the others.
-- **`Pause`** (checkout, `c`): commits each worktree's changes, removes the worktrees but keeps the branches, detaches tmux, copies the branch name to the clipboard.
-- **`Resume`**: recreates only the worktrees that are missing or invalid (so it doesn't discard uncommitted work), then restores or restarts tmux. Refuses if a branch is checked out in its real repo.
-  - A restart (the tmux session had ended) of a Claude instance continues the conversation last seen in its pane: `--resume <InstanceData.ClaudeSessionID>`, if Claude Code saved it (`claudestatus.HasTranscript`, which needs one message). That also reconnects the conversation's Remote Control session, so its claude.ai link stays the same.
+- There is no checkout: this fork removed upstream's `c` (commit, remove the worktrees, copy the branch name). An instance is only `Paused` when its tmux session is gone.
+- **`Resume`** (`r`): recreates only the worktrees that are missing or invalid (so it doesn't discard uncommitted work), then restores or restarts tmux. Instances checked out by older builds get their worktrees back from their branches this way.
+  - A restart (the tmux session had ended) of a Claude instance continues the conversation last seen in its pane: `--resume <InstanceData.ClaudeSessionID>`, if Claude Code saved it (`claudestatus.HasTranscript`, which needs one message). The metadata tick reads that id from Claude Code's registry `~/.claude/sessions/<pid>.json` (`ComputeClaudeProcess` → `SetClaudeProcess`) and saves it when it changes.
   - If the session then ends within 15 s (`MarkEnded`), the conversation could not be continued: the id is dropped and the next `r` starts afresh.
 - **`Kill`**: closes tmux, then removes the worktrees, their branches (unless pre-existing), the workspace directory and the Claude settings directory.
   - Claude Code can move a conversation to the background, for example from its agents view, where it outlives tmux. Resuming it elsewhere then fails with "is running in the background".
   - So Kill first reads the pane's conversation id (`paneSessionID`). `stopBackgroundConversation` then polls `claude agents --json` a few times in a goroutine and runs `claude stop <id>` on the matching background entry. It matches by id prefix, or by `--name` plus cwd when the id is unknown.
 - A tmux session that disappears, for example because the program exited, makes `HasUpdated`'s capture fail. `SessionEnded` then confirms it, and the metadata tick marks the instance `Paused`, so `r` restarts it. `Preview` treats a vanished session as empty rather than as an error.
 - **Fork** (`f`, `NewFork`, Claude only): a new instance continues the source's conversation.
-  - `workspace.Fork` copies every worktree of the source with `GitWorktree.Snapshot` / `SetupFrom`. The commits come along, and so do uncommitted and untracked files, left uncommitted. The copy sits on a new branch, keeps the source's base commit, and the source is left untouched. A paused source is copied from its branch tip.
+  - `workspace.Fork` copies every worktree of the source with `GitWorktree.Snapshot` / `SetupFrom`. The commits come along, and so do uncommitted and untracked files, left uncommitted. The copy sits on a new branch, keeps the source's base commit, and the source is left untouched. A source without worktrees (checked out by an older build) is copied from its branch tip.
   - It launches with `--resume <session_id> --fork-session`, from the id the status line reported. This works across worktrees of a repo.
   - The fork's appended system prompt names the source's worktrees. The hook redirects edits aimed at another session's workspace (`inOtherWorkspace`) to the fork's own copy.
-- **Resume a conversation** (`C`, `ResumeConversation`): starts an instance titled `resume` that runs `claude --resume` without `--name`, which opens Claude's own picker inside the session. Ctrl+W there lists other worktrees' sessions.
+- **Resume a conversation** (`C`, `ResumeConversation`): asks for a folder first (the folder picker, launch directory first), because Claude's picker lists the conversations of the folder it runs in. Then starts an instance titled `resume` there that runs `claude --resume` without `--name`, which opens Claude's own picker inside the session.
+  - In a git repo the session runs in a new worktree, whose own conversations Claude's picker lists: none. `WidenResumePicker` (idle metadata ticks) presses Ctrl+W once the picker's hint says "Ctrl+W to show all worktrees", so it lists the whole repo's, main checkout included. `--resume` from a worktree continues them there (verified on 2.1.291).
+  - Such a workspace is marked `ContinueConversation`: Setup writes a system prompt telling Claude to use the worktree's paths, since the conversation's history names the main checkout and single-repo sessions have no hook. `Start` sets the tmux program again after Setup, so arguments naming files Setup writes are included.
+  - Titles from `uniqueTitle` also skip names of existing tmux sessions (another cs may hold `claudesquad_resume`).
   - cs goes straight into typing mode, so the picker takes your keys.
   - Once the status line reports `session_name`, the instance takes that name as its title (`AdoptClaudeName`, made unique and cut to 32 characters). It sends `/rename` back only if the title had to differ.
 - `launchArgs` (resume or fork flags) apply to the first `Start(true)` only. `Start` then resets the tmux program; a later restart continues the pane's last conversation instead (see `Resume`).
@@ -85,8 +89,8 @@ Claude runs in the real directory, so Read/Grep/Glob see every repo as usual. Ea
   - The hook's stdout is Claude Code's response, so `cs hook` must print nothing else there (no `log.Close`).
   - If the workspace no longer exists, the hook denies every tool except Read/Grep/Glob. This happens when a Claude process outlives its killed session. A failing hook would let changes through to the real checkouts.
 - **State**: `<dir>/.claudesquad/repos.json` (repo name + base commit) is the source of truth. The hook writes it under a file lock with atomic renames, and the TUI re-reads it on every diff tick. Worktrees are created from each repo's current HEAD on branch `<prefix><title>`.
-- **Diff/list**: `DiffStats.Repos` holds one `RepoDiff` per repo with changes; the aggregate `Content` stays empty. The diff tab shows one repo at a time under a selector bar. `←/→` (`KeyPrevRepo`/`KeyNextRepo`) switch repos, and the selection is kept by name across refreshes. In the list, an unselected instance shows `N repos`; the selected one lists each changed repo with its counts, indented below its info row, in whatever height the list has left.
-- **Pause/kill**: these loop over the repos via the existing `GitWorktree` methods. `Cleanup` refuses to delete anything outside `~/.claude-squad/workspaces`. `cs reset` calls `workspace.CleanupAll`.
+- **Diff/list**: `DiffStats.Repos` holds one `RepoDiff` per repo with changes; the aggregate `Content` stays empty. The diff tab shows one repo at a time under a selector bar. `←/→` (`KeyPrevRepo`/`KeyNextRepo`) switch repos, and the selection is kept by name across refreshes. In the list, an unselected instance shows `N repos`; the selected one lists each changed repo with its counts, indented below its info row, in whatever height the list has left and at least a third of it (the list scrolls for that).
+- **Resume/kill**: these loop over the repos via the existing `GitWorktree` methods. `Cleanup` refuses to delete anything outside `~/.claude-squad/workspaces`. `cs reset` calls `workspace.CleanupAll`.
 - **Facts verified against Claude Code 2.1.x**:
   - Grep/Glob do not descend into symlinked directories.
   - Edits through a symlink that resolves outside the project need extra permission.
@@ -110,41 +114,9 @@ The list's info row shows `<model> · <context used>/<window> · <effort>` for C
 - The metadata tick reads `status.json` for every active instance (`ComputeClaudeInfo` → `SetClaudeInfo`).
 - The limits belong to the account. The metadata tick reads `limits.json` and the list's title row shows it (`List.SetLimits`). It shows `5h – · wk –` before any limits are known, and 0% for a window whose reset time has passed.
 
-### Remote Control (`session/remote_control.go`, fork-specific)
-
-Remote Control connects a Claude session to a session on claude.ai, so claude.ai/code and the Claude app continue it while it keeps running on this machine (the VM or the laptop). Nothing moves between machines.
-
-- New Claude instances get `Instance.RemoteControl` from config `remote_control` (a `*bool`; unset means on) and launch with `--remote-control` after `--name`. The flag, not `remoteControlAtStartup` in cs's `--settings`, because background sessions inherit `--settings`. It is persisted, so restarts keep it.
-- Claude Code records the connection in its registry `~/.claude/sessions/<pid>.json` as `bridgeSessionId` (set to `null` on disconnect); the link is `https://claude.ai/code/<bridgeSessionId>`. Neither the status line input nor the docs carry it.
-  - The metadata tick reads the entry (`ComputeClaudeProcess` → `SetClaudeProcess`), which also yields the pane's conversation id that a restart resumes. A changed id is saved.
-- `RemoteState`: `RC` before the status icon in the list, blue when connected, gray while connecting / paused / waiting to send `/remote-control`, red when still off 45 s after it was asked for (trust dialog, login, network, or disconnected from Claude's own panel).
-- `w` (`app/remote.go`): when connected, it shows the link with a QR code (`skip2/go-qrcode`, dropped if the terminal is too short) and copies it.
-  - Copying tries the machine's clipboard, then `tmux load-buffer -w` inside tmux (tmux drops a program's OSC 52 by default), then OSC 52.
-  - `o` opens a browser (not over SSH). `d` turns `RemoteControl` off and sends `/remote-control`, which opens Claude's panel; cs switches to typing mode so the user picks "Disconnect this session". The panel's options vary, so cs does not navigate it.
-- `w` on a session without a connection sets `RemoteControl` and queues `/remote-control`. `SyncRemoteControl` sends it on an idle tick with an empty prompt, after `SyncClaudeName` and never in the same tick, and drops it if the session connected meanwhile; sent while connected, it would open the panel instead.
-- Verified against Claude Code 2.1.289: `--resume <id>` with or without `--remote-control` reconnects the same claude.ai session; `--resume <src> --fork-session` gets a new one and leaves the source's alone; `remoteControlAtStartup: true` in `--settings` works too.
-
-### Starting sessions from the Claude app (`app/server.go`, `app/new.go`, `app/skill.go`, fork-specific)
-
-The Claude app can only start a conversation on a machine that runs `claude remote-control` (server mode). Those conversations are headless children of the server (`claude --print --sdk-url … --session-id cse_…`, registry `entrypoint: "sdk-cli"`) with no terminal. If cs kills one, the server marks it failed and does not respawn it. So cs does not take them over: the conversation starts a real cs session with `cs new` instead.
-
-- **Server** (`remoteServer`, config `remote_server`, unset means on): the TUI keeps `claude remote-control --spawn same-dir --no-create-session-in-dir` running for its launch directory, in tmux session `claudesquad-rc_<dir>_<hash>`. It outlives cs.
-  - Server mode refuses flags it cannot pass to its sessions, such as `--settings`, so only the claude binary is used.
-  - The pane is created as a shell, then `remain-on-exit` is set, then `respawn-pane` runs the server. That way a server that exits at once keeps its output. A dead pane is respawned 30 s after the last start.
-  - `check` runs on the metadata tick at most every 2 s. `·✔︎· Ready`/`Connected` means ready; `[y/N]`, `(y/n)` or `Choose [` means it waits for an answer (`tmux attach -t <name>`). The list's title row shows `server` in blue, gray or red.
-- **Skill**: on start, the TUI writes `~/.claude/skills/claude-squad/SKILL.md` (or under `$CLAUDE_CONFIG_DIR`), naming its own binary. It rewrites the file only while it carries cs's marker comment. The skill tells Claude to run `cs new --title … --prompt …` and reply with the printed link.
-- **`cs new`** (`NewSession`) starts an instance like the TUI's `n` in `--path` (default: cwd), with Remote Control on.
-  - It writes the instance to the inbox, `~/.claude-squad/inbox/<hex nanos>.json` (InstanceData, written as `.tmp` and renamed). It cannot add to `state.json`, because a running TUI saves its own list over it.
-  - It waits for Claude's empty prompt (`WaitUntilReady`). It never types into the trust dialog, where Enter means "No, exit".
-  - It sends the task (`SendTask`; a multi-line task goes as one bracketed paste), waits up to 30 s for `bridgeSessionId`, and prints the link.
-  - Titles are unique against `state.json`, the inbox and existing tmux sessions (`session.StoredTitles`, `UniqueTitle`).
-- **Inbox pickup**: the metadata tick reads the inbox, and `adoptInbox` loads each item with `FromInstanceData` (reattaching tmux), appends it to the list and saves. Only then are the files removed.
-  - It waits while an instance is being named or started (`canAdoptInbox`), because the list's last item is that instance. `newHome` drains the inbox on start too.
-- `main` now exits 1 on an error and prints it once (`SilenceErrors`), so `cs new` failures show as failures to the calling Claude.
-
 ### Persistence (`config/`, `session/storage.go`)
 
-- `~/.claude-squad/config.json` → `config.Config` (default program, `auto_yes`, `daemon_poll_interval`, `branch_prefix`, `profiles`, `remote_control`, `remote_server`, `mouse`). Created with defaults on first load; `DefaultConfig` resolves the `claude` path via the user's shell.
+- `~/.claude-squad/config.json` → `config.Config` (default program, `auto_yes`, `daemon_poll_interval`, `branch_prefix`, `profiles`, `mouse`). Created with defaults on first load; `DefaultConfig` resolves the `claude` path via the user's shell.
 - `~/.claude-squad/state.json` → `config.State`; instances are stored as raw JSON and decoded by `session.Storage`.
 - Only started instances are saved. Adding a persisted field means updating `InstanceData` / `WorkspaceData` **and** both `ToInstanceData` and `FromInstanceData`.
 
@@ -155,9 +127,10 @@ The Claude app can only start a conversation on a machine that runs `claude remo
   - `tickUpdateMetadataCmd` self-chains every 500ms. It checks every active instance in parallel goroutines (tmux pane hash for running vs ready, prompt detection, git diff). Only the selected instance gets a full diff; the others get `--numstat` counts to bound memory.
   - Results come back as `metadataUpdateDoneMsg` and are applied in `Update` on the main thread (`SetStatus`, `SetDiffStats`). Never mutate `Instance` state from the background goroutine.
   - `previewTickMsg` refreshes the preview pane every 100ms; new instances start in the background via `runInstanceStartCmd`.
-- The right-hand `ui.TabbedWindow` has Preview (captured agent pane, shown at full height with no ellipsis row; if the capture is taller than the pane, the bottom rows), Diff, and Terminal tabs. The Terminal tab keeps a separate shell tmux session per instance in `GetWorkDir()`.
+- The right-hand `ui.TabbedWindow` has Preview (captured agent pane, shown at full height with no ellipsis row; if the capture is taller than the pane, the bottom rows), Diff, and Terminal tabs.
+  - Preview captures with `CaptureScreen` (no `-J`, so one line per pane row) and draws the pane's cursor (`Instance.PreviewCursor`, tmux `#{cursor_x}`/`#{cursor_y}`/`#{cursor_flag}`) as a reverse-video cell (`withCursor`). Claude Code's prompt uses the terminal's real cursor, which `capture-pane` leaves out. The Terminal tab keeps a separate shell tmux session per instance in `GetWorkDir()`.
 - The Diff tab does not show raw `git diff`. `ui/diffview.go` parses it, counting hunk lines from the `@@` header, and renders file header bars, old/new line numbers, full-width tinted `+`/`-` rows and word-aware wrapping to the pane width. `DiffPane.setRaw` caches the rendering, because the diff refreshes every 100ms.
-- `GlobalInstanceLimit = 10`.
+- `GlobalInstanceLimit = 20`. The list scrolls: `List.scroll` moves `offset` only when the selection leaves the view, and `↑/↓ N more` rows (the row under the title, the row after the last instance in view) count the instances out of view.
 
 ### AutoYes and the daemon (`daemon/`)
 
@@ -180,9 +153,11 @@ Both detect screens by literal UI strings. Support for a new agent, or a fix aft
 
 ### Keybindings
 
-`keys/keys.go` is the source of truth (`GlobalKeyStringsMap` + `GlobalkeyBindings`). This fork removed upstream's push key (`p`), along with all `gh` usage; pushing is left to the user or the agent. It added `R` (rename), `f` (fork), `` ` `` (type into the session) and `w` (Remote Control).
+`keys/keys.go` is the source of truth (`GlobalKeyStringsMap` + `GlobalkeyBindings`). This fork removed upstream's push key (`p`), along with all `gh` usage, and checkout (`c`); pushing and checking out are left to the user or the agent. It added `R` (rename), `f` (fork), `` ` `` (type into the session), `v` (open `Instance.EditorDir()` in VS Code: `open -a`, which also brings it to the front, on macOS, else `code`; `EditorDir` counts the worktree directories on disk, since an agent may add one itself) and `tab` while naming (folder picker).
 
-- **Typing mode** (`stateFocus`): `` ` `` switches to the Preview tab. `handleKeyPress` then sends every key except `` ` `` to the selected session.
+- The bottom menu drops the descriptions outside the highlighted group when it is wider than the terminal (`Menu.renderOptions`). `J/K reorder` shows only in the Preview tab.
+
+- **Typing mode** (`stateFocus`): `` ` `` or `→` (`KeyFocusRight`; in the Diff tab of a session with several changed repos `←/→` switch repos instead, `ui.ArrowsSwitchRepos`) switches to the Preview tab. While typing, the selected list row is drawn in `focusColor` with its colored details plain (`List.SetTyping`). `handleKeyPress` then sends every key except `` ` `` to the selected session.
   - `keyBytes` turns a key back into terminal bytes. Pastes keep their bracketed-paste markers.
   - `Instance.SendKeys` writes those bytes to the tmux client PTY that cs keeps attached.
   - `View` derives the orange window border (`TabbedWindow.SetFocused`) and the menu (`Menu.SetFocusMode`) from `m.state`. Any state change, such as a help screen popping up, therefore ends typing mode cleanly.

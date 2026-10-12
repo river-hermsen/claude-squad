@@ -29,8 +29,6 @@ type helpTypeInstanceStart struct {
 
 type helpTypeInstanceAttach struct{}
 
-type helpTypeInstanceCheckout struct{}
-
 func helpStart(instance *session.Instance) helpText {
 	return helpTypeInstanceStart{instance: instance}
 }
@@ -44,33 +42,24 @@ func (h helpTypeGeneral) toContent() string {
 		headerStyle.Render("Managing:"),
 		keyStyle.Render("n")+descStyle.Render("         - Create a new session"),
 		keyStyle.Render("N")+descStyle.Render("         - Create a new session with a prompt"),
-		keyStyle.Render("C")+descStyle.Render("         - Resume a Claude conversation (claude -r); the session takes its name"),
+		keyStyle.Render("tab")+descStyle.Render("       - While naming a new session: start it in another folder"),
+		keyStyle.Render("C")+descStyle.Render("         - Resume a Claude conversation (claude -r) from a folder you pick; the session takes its name"),
 		keyStyle.Render("f")+descStyle.Render("         - Fork: a new session continuing this conversation on a copy of its changes"),
 		keyStyle.Render("R")+descStyle.Render("         - Rename the selected session (its branch keeps its name)"),
 		keyStyle.Render("D")+descStyle.Render("         - Kill (delete) the selected session"),
-		keyStyle.Render("↑/j, ↓/k")+descStyle.Render("  - Navigate between sessions"),
-		keyStyle.Render("J/K")+descStyle.Render("       - Reorder sessions"),
-		keyStyle.Render("`")+descStyle.Render("         - Type into the selected session from here; ` again to stop"),
+		keyStyle.Render("↑/k, ↓/j")+descStyle.Render("  - Navigate between sessions"),
+		keyStyle.Render("K/J")+descStyle.Render("       - Move the selected session up/down in the list"),
+		keyStyle.Render("→ or `")+descStyle.Render("    - Type into the selected session from here; ` stops"),
 		keyStyle.Render("↵/o")+descStyle.Render("       - Attach to the selected session"),
+		keyStyle.Render("v")+descStyle.Render("         - Open the session's worktree in VS Code"),
 		keyStyle.Render("ctrl-q")+descStyle.Render("    - Detach from session"),
-		"",
-		headerStyle.Render("Handoff:"),
-		keyStyle.Render("c")+descStyle.Render("         - Checkout: commit changes and pause session"),
-		keyStyle.Render("r")+descStyle.Render("         - Resume a paused session; a Claude session continues its conversation"),
-		"",
-		headerStyle.Render("Remote Control (claude.ai/code and the Claude app):"),
-		keyStyle.Render("w")+descStyle.Render("         - Show the session's link and QR code, or turn Remote Control on"),
-		descStyle.Render("            RC by a session: blue connected, gray connecting, red failed (w retries)"),
-		descStyle.Render("            New sessions get it unless the config sets \"remote_control\": false"),
-		descStyle.Render("server    - Above the list: the Claude app can start a conversation on this machine;"),
-		descStyle.Render("            ask it to \"start a cs session for ...\" and it runs cs new"),
-		keyStyle.Render("cs new")+descStyle.Render("    - Start a session from any shell; it shows here and prints its link"),
+		keyStyle.Render("r")+descStyle.Render("         - Resume a paused session (its program had exited); a Claude session continues its conversation"),
 		"",
 		headerStyle.Render("Other:"),
 		keyStyle.Render("tab")+descStyle.Render("       - Switch between preview, diff, and terminal tabs"),
 		keyStyle.Render("shift-↓/↑")+descStyle.Render(" - Scroll in preview/diff/terminal view (or the mouse wheel)"),
 		keyStyle.Render("key+drag")+descStyle.Render("  - Select text for ⌘C, holding "+selectionKey()+"; ⌘V pastes"),
-		keyStyle.Render("←/→")+descStyle.Render("       - Switch repository in the diff tab (multi-repo sessions)"),
+		keyStyle.Render("←/→")+descStyle.Render("       - Switch repository in the diff tab, when a session changed several"),
 		keyStyle.Render("q")+descStyle.Render("         - Quit the application"),
 	)
 	return content
@@ -92,9 +81,6 @@ func (h helpTypeInstanceStart) toContent() string {
 			keyStyle.Render("↵/o")+descStyle.Render("   - Attach to the session to interact with it directly"),
 			keyStyle.Render("tab")+descStyle.Render("   - Switch preview panes to view the diff across repositories"),
 			keyStyle.Render("D")+descStyle.Render("     - Kill (delete) the session and its worktrees"),
-			"",
-			headerStyle.Render("Handoff:"),
-			keyStyle.Render("c")+descStyle.Render("     - Commit each changed repository and pause"),
 		)
 	}
 	if h.instance.InPlace() {
@@ -126,9 +112,6 @@ func (h helpTypeInstanceStart) toContent() string {
 		keyStyle.Render("↵/o")+descStyle.Render("   - Attach to the session to interact with it directly"),
 		keyStyle.Render("tab")+descStyle.Render("   - Switch preview panes to view session diff"),
 		keyStyle.Render("D")+descStyle.Render("     - Kill (delete) the selected session"),
-		"",
-		headerStyle.Render("Handoff:"),
-		keyStyle.Render("c")+descStyle.Render("     - Checkout this instance's branch"),
 	)
 	return content
 }
@@ -142,20 +125,6 @@ func (h helpTypeInstanceAttach) toContent() string {
 	return content
 }
 
-func (h helpTypeInstanceCheckout) toContent() string {
-	content := lipgloss.JoinVertical(lipgloss.Left,
-		titleStyle.Render("Checkout Instance"),
-		"",
-		"Changes will be committed locally. The branch name has been copied to your clipboard for you to checkout.",
-		"",
-		"Feel free to make changes to the branch and commit them. When resuming, the session will continue from where you left off.",
-		"",
-		headerStyle.Render("Commands:"),
-		keyStyle.Render("c")+descStyle.Render(" - Checkout: commit changes locally and pause session"),
-		keyStyle.Render("r")+descStyle.Render(" - Resume a paused session"),
-	)
-	return content
-}
 func (h helpTypeGeneral) mask() uint32 {
 	return 1
 }
@@ -165,9 +134,6 @@ func (h helpTypeInstanceStart) mask() uint32 {
 }
 func (h helpTypeInstanceAttach) mask() uint32 {
 	return 1 << 2
-}
-func (h helpTypeInstanceCheckout) mask() uint32 {
-	return 1 << 3
 }
 
 var (

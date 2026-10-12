@@ -24,8 +24,6 @@ type InstanceData struct {
 	DiffStats DiffStatsData  `json:"diff_stats"`
 	// ClaudeDir holds the Claude Code settings and status of a Claude instance.
 	ClaudeDir string `json:"claude_dir,omitempty"`
-	// RemoteControl starts the Claude Code session with Remote Control on.
-	RemoteControl bool `json:"remote_control,omitempty"`
 	// ClaudeSessionID is the Claude Code conversation the instance last ran, which a restart
 	// continues.
 	ClaudeSessionID string `json:"claude_session_id,omitempty"`

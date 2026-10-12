@@ -19,7 +19,6 @@ const (
 	KeyTab        // Tab is a special keybinding for switching between panes.
 	KeySubmitName // SubmitName is a special keybinding for submitting the name of a new instance.
 
-	KeyCheckout
 	KeyResume
 	KeyPrompt // New key for entering a prompt
 	KeyHelp   // Key for showing help screen
@@ -44,8 +43,14 @@ const (
 	KeyFocus
 	// KeyFocusExit is KeyFocus pressed again, while typing into a session; see KeyFocus.
 	KeyFocusExit
-	// KeyRemote shows the selected session's Remote Control link, or turns Remote Control on.
-	KeyRemote
+	// KeyEditor opens the selected session's worktree in VS Code.
+	KeyEditor
+	// KeyFocusRight is → in the list, which starts typing like KeyFocus, except where ←/→
+	// switch repositories in the diff tab.
+	KeyFocusRight
+	// KeyFolder is tab while a new session is being named: it picks the folder the session
+	// starts in.
+	KeyFolder
 )
 
 // GlobalKeyStringsMap is a global, immutable map string to keybinding.
@@ -65,7 +70,6 @@ var GlobalKeyStringsMap = map[string]KeyName{
 	"D":          KeyKill,
 	"q":          KeyQuit,
 	"tab":        KeyTab,
-	"c":          KeyCheckout,
 	"r":          KeyResume,
 	"?":          KeyHelp,
 	"left":       KeyPrevRepo,
@@ -74,7 +78,7 @@ var GlobalKeyStringsMap = map[string]KeyName{
 	"f":          KeyFork,
 	"C":          KeyResumeClaude,
 	"`":          KeyFocus,
-	"w":          KeyRemote,
+	"v":          KeyEditor,
 }
 
 // GlobalkeyBindings is a global, immutable map of KeyName tot keybinding.
@@ -119,10 +123,6 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 		key.WithKeys("N"),
 		key.WithHelp("N", "new with prompt"),
 	),
-	KeyCheckout: key.NewBinding(
-		key.WithKeys("c"),
-		key.WithHelp("c", "checkout"),
-	),
 	KeyTab: key.NewBinding(
 		key.WithKeys("tab"),
 		key.WithHelp("tab", "switch tab"),
@@ -138,7 +138,7 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 	),
 	KeyMoveDown: key.NewBinding(
 		key.WithKeys("J"),
-		key.WithHelp("J", "move down"),
+		key.WithHelp("J/K", "reorder"),
 	),
 
 	KeyPrevRepo: key.NewBinding(
@@ -166,9 +166,9 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 		key.WithKeys("`"),
 		key.WithHelp("`", "type"),
 	),
-	KeyRemote: key.NewBinding(
-		key.WithKeys("w"),
-		key.WithHelp("w", "remote"),
+	KeyEditor: key.NewBinding(
+		key.WithKeys("v"),
+		key.WithHelp("v", "vs code"),
 	),
 
 	// -- Special keybindings --
@@ -181,5 +181,15 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 	KeySubmitName: key.NewBinding(
 		key.WithKeys("enter"),
 		key.WithHelp("enter", "submit name"),
+	),
+
+	KeyFocusRight: key.NewBinding(
+		key.WithKeys("right"),
+		key.WithHelp("→/`", "type"),
+	),
+
+	KeyFolder: key.NewBinding(
+		key.WithKeys("tab"),
+		key.WithHelp("tab", "folder"),
 	),
 }

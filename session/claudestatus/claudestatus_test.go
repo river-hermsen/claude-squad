@@ -65,9 +65,13 @@ func TestRunStatusLineSavesInfoAndRunsUserStatusLine(t *testing.T) {
 	require.NotNil(t, limits)
 	require.WithinDuration(t, time.Now(), limits.UpdatedAt, time.Minute)
 	limits.UpdatedAt = time.Time{}
+	// JSON keeps the instant but not the time.Location: on a UTC machine, such as CI, a decoded
+	// time has none while time.Unix returns Local.
+	limits.FiveHour.ResetsAt = limits.FiveHour.ResetsAt.UTC()
+	limits.Week.ResetsAt = limits.Week.ResetsAt.UTC()
 	require.Equal(t, &Limits{
-		FiveHour: Limit{UsedPercent: 12, ResetsAt: time.Unix(1791216000, 0)},
-		Week:     Limit{UsedPercent: 40.4, ResetsAt: time.Unix(1791734400, 0)},
+		FiveHour: Limit{UsedPercent: 12, ResetsAt: time.Unix(1791216000, 0).UTC()},
+		Week:     Limit{UsedPercent: 40.4, ResetsAt: time.Unix(1791734400, 0).UTC()},
 	}, limits)
 }
 
@@ -199,21 +203,15 @@ func TestSessionIDForPID(t *testing.T) {
 	require.Empty(t, SessionIDForPID(1))
 }
 
-// Claude Code records a session's Remote Control connection in its registry, and sets it to
-// null when the session disconnects.
-func TestReadProcessRemoteSession(t *testing.T) {
+func TestReadProcess(t *testing.T) {
 	claudeDir := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", claudeDir)
 	writeSettings(t, filepath.Join(claudeDir, "sessions", "3419664.json"),
-		`{"pid":3419664,"sessionId":"4a7c77ad-4cc4-41ae-bb7a-a51f0832c95e","kind":"interactive","bridgeSessionId":"session_01PGK9UUiG9Uvb8nTr2TH9bP"}`)
-	writeSettings(t, filepath.Join(claudeDir, "sessions", "3419665.json"),
-		`{"pid":3419665,"sessionId":"197f0c7d-cc2b-42f8-8b35-6dc2c9aa6b8f","kind":"interactive","bridgeSessionId":null}`)
+		`{"pid":3419664,"sessionId":"4a7c77ad-4cc4-41ae-bb7a-a51f0832c95e","kind":"interactive"}`)
 
 	p := ReadProcess(3419664)
 	require.NotNil(t, p)
 	require.Equal(t, "4a7c77ad-4cc4-41ae-bb7a-a51f0832c95e", p.SessionID)
-	require.Equal(t, "session_01PGK9UUiG9Uvb8nTr2TH9bP", p.RemoteSessionID)
-	require.Empty(t, ReadProcess(3419665).RemoteSessionID)
 	require.Nil(t, ReadProcess(1))
 	require.Nil(t, ReadProcess(0))
 }

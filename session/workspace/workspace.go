@@ -50,6 +50,9 @@ type Workspace struct {
 	existingBranch bool
 	// forkOf is the workspace a fork copies its worktrees from. Only used by Setup.
 	forkOf *Workspace
+	// continues is true for a single-repo workspace whose session continues a conversation
+	// from elsewhere; see ContinueConversation. Only used by Setup.
+	continues bool
 }
 
 // Repo is a repository that has been given a worktree in the workspace.
@@ -161,6 +164,13 @@ func Fork(src *Workspace, sessionName string) (*Workspace, error) {
 	w.singleRepo = src.singleRepo
 	w.forkOf = src
 	return w, nil
+}
+
+// ContinueConversation marks a single-repo workspace as one whose session continues a
+// conversation that may have run in the repository itself or another of its worktrees.
+// Setup then writes instructions to use the worktree's paths. Call it before Setup.
+func (w *Workspace) ContinueConversation() {
+	w.continues = true
 }
 
 // FromStorage rebuilds a workspace from saved instance data.
@@ -279,8 +289,12 @@ func (w *Workspace) Setup() error {
 		return writeFileAtomic(w.metaPath(promptFileName), []byte(w.systemPrompt()))
 	}
 	if w.singleRepo != "" {
-		_, err := w.isolate(w.singleRepo, w.existingBranch)
-		return err
+		if _, err := w.isolate(w.singleRepo, w.existingBranch); err != nil {
+			return err
+		}
+		if !w.continues {
+			return nil
+		}
 	}
 	return writeFileAtomic(w.metaPath(promptFileName), []byte(w.systemPrompt()))
 }
@@ -340,6 +354,13 @@ claude-squad isolates each repository the first time you change it: before your 
 
 When a tool call is blocked with such a message, follow it and redo the call in the worktree.
 `, w.sessionName, w.root, w.root, w.dir, w.branchName, w.root)
+	}
+	if w.singleRepo != "" && w.continues {
+		repo, worktree := filepath.Join(w.root, w.singleRepo), w.WorktreePath(w.singleRepo)
+		fmt.Fprintf(&prompt, `You are running in claude-squad session %q, in a git worktree of %s at %s on branch %s.
+
+This conversation may have started in %s itself or in another of its worktrees, so earlier messages can name files there. Use the same paths under %s instead, and never change files in %s.
+`, w.sessionName, repo, worktree, w.branchName, repo, worktree, repo)
 	}
 	if w.forkOf != nil {
 		fmt.Fprintf(&prompt, `
@@ -488,63 +509,8 @@ func (w *Workspace) diff(diffFn func(*git.GitWorktree) *git.DiffStats) *git.Diff
 	return stats
 }
 
-// CheckedOutRepos returns the repositories whose session branch is checked out in the
-// real checkout. Their worktrees cannot be recreated, nor their branches deleted.
-func (w *Workspace) CheckedOutRepos() ([]string, error) {
-	repos, err := w.Repos()
-	if err != nil {
-		return nil, err
-	}
-	var checkedOut []string
-	for _, r := range repos {
-		ok, err := w.worktree(r).IsBranchCheckedOut()
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			checkedOut = append(checkedOut, r.Name)
-		}
-	}
-	return checkedOut, nil
-}
-
-// Pause commits each repository's changes to its session branch and removes the worktrees,
-// keeping the branches.
-func (w *Workspace) Pause(commitMessage string) error {
-	repos, err := w.Repos()
-	if err != nil {
-		return err
-	}
-	var errs []error
-	for _, r := range repos {
-		wt := w.worktree(r)
-		if valid, err := wt.IsValidWorktree(); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", r.Name, err))
-			continue
-		} else if !valid {
-			_ = os.RemoveAll(wt.GetWorktreePath())
-			if err := wt.Prune(); err != nil {
-				errs = append(errs, fmt.Errorf("%s: %w", r.Name, err))
-			}
-			continue
-		}
-		if err := wt.CommitChanges(commitMessage); err != nil {
-			// Removing the worktree now would lose the uncommitted changes.
-			errs = append(errs, fmt.Errorf("%s: %w", r.Name, err))
-			continue
-		}
-		if err := wt.Remove(); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", r.Name, err))
-			continue
-		}
-		if err := wt.Prune(); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", r.Name, err))
-		}
-	}
-	return errors.Join(errs...)
-}
-
-// Resume recreates the worktrees that Pause removed, from their session branches.
+// Resume recreates worktrees that are missing, from their session branches. A session that
+// claude-squad's old checkout paused, or whose worktree was deleted, gets its work back.
 func (w *Workspace) Resume() error {
 	repos, err := w.Repos()
 	if err != nil {

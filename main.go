@@ -28,7 +28,6 @@ var (
 	statusOutFlag string
 	limitsFlag    string
 	binName       string
-	newOpts       = app.NewSessionOptions{}
 	rootCmd       = &cobra.Command{
 		Use:   "claude-squad",
 		Short: "Claude Squad - Manage multiple AI agents like Claude Code, Aider, Codex, and Amp.",
@@ -175,23 +174,6 @@ var (
 		},
 	}
 
-	// newCmd starts a session without the TUI, as a Claude conversation started from the
-	// Claude app through the Remote Control server does; see app.NewSession.
-	newCmd = &cobra.Command{
-		Use:   "new",
-		Short: "Start a session without the TUI and print its Remote Control link",
-		Long: "Start a session in the current directory, the way the TUI's n does, give it a task once " +
-			"it is ready, and print its Remote Control link. The cs TUI shows it in its list.",
-		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			// No log.Close: it prints the log path, which would end up in what Claude relays.
-			log.Initialize(false)
-			cmd.SilenceUsage = true
-			tmux.CaptureMouse = config.LoadConfig().MouseEnabled()
-			return app.NewSession(newOpts, os.Stdout)
-		},
-	}
-
 	versionCmd = &cobra.Command{
 		Use:   "version",
 		Short: "Print the version number",
@@ -227,14 +209,7 @@ func init() {
 		panic(err)
 	}
 
-	newCmd.Flags().StringVar(&newOpts.Title, "title", "", "Title of the session (default: from the prompt)")
-	newCmd.Flags().StringVar(&newOpts.Prompt, "prompt", "", "Task to give the session once it is ready")
-	newCmd.Flags().StringVar(&newOpts.Path, "path", "", "Directory to start the session in (default: the current one)")
-	newCmd.Flags().StringVarP(&newOpts.Program, "program", "p", "", "Program to run (default: from the config)")
-	newCmd.Flags().BoolVar(&newOpts.RemoteControl, "remote-control", true, "Start a Claude Code session with Remote Control on")
-
 	rootCmd.AddCommand(debugCmd)
-	rootCmd.AddCommand(newCmd)
 	rootCmd.AddCommand(hookCmd)
 	rootCmd.AddCommand(statusLineCmd)
 	rootCmd.AddCommand(versionCmd)

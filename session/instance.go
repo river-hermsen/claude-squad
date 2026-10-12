@@ -13,8 +13,6 @@ import (
 	"os"
 	"strings"
 	"time"
-
-	"github.com/atotto/clipboard"
 )
 
 type Status int
@@ -54,9 +52,6 @@ type Instance struct {
 	AutoYes bool
 	// Prompt is the initial prompt to pass to the instance on startup
 	Prompt string
-	// RemoteControl is true if the Claude Code session runs with Remote Control on, so that
-	// claude.ai/code and the Claude app can continue it; see remote_control.go.
-	RemoteControl bool
 
 	// DiffStats stores the current git diff statistics
 	diffStats *git.DiffStats
@@ -89,22 +84,14 @@ type Instance struct {
 	// adoptsClaudeName is true for an instance resuming a conversation picked in Claude Code,
 	// until it has taken that conversation's name as its title; see AdoptClaudeName.
 	adoptsClaudeName bool
+	// resumePickerWidened is true once WidenResumePicker pressed Ctrl+W in Claude Code's picker.
+	resumePickerWidened bool
 	// claudeSessionID is the conversation last seen running in the tmux pane. Restarting the
 	// instance after its tmux session ended continues it; see Resume.
 	claudeSessionID string
 	// resumedAt is when Resume last restarted the instance on claudeSessionID, or zero if it
 	// started it afresh; see MarkEnded.
 	resumedAt time.Time
-
-	// remoteSessionID is the claude.ai session Remote Control connects the running Claude Code
-	// session to, or "" while Remote Control is off; see SetClaudeProcess.
-	remoteSessionID string
-	// remoteSince is when Remote Control was last asked for, by starting the session with it or
-	// switching it on. RemoteState counts it as failed if it is still off well after.
-	remoteSince time.Time
-	// pendingRemoteControl is true while `/remote-control` waits for Claude Code to be idle;
-	// see SyncRemoteControl.
-	pendingRemoteControl bool
 }
 
 // ToInstanceData converts an Instance to its serializable form
@@ -122,7 +109,6 @@ func (i *Instance) ToInstanceData() InstanceData {
 		AutoYes:   i.AutoYes,
 		ClaudeDir: i.claudeDir,
 
-		RemoteControl:   i.RemoteControl,
 		ClaudeSessionID: i.claudeSessionID,
 	}
 
@@ -160,7 +146,6 @@ func FromInstanceData(data InstanceData) (*Instance, error) {
 		UpdatedAt: data.UpdatedAt,
 		Program:   data.Program,
 
-		RemoteControl:   data.RemoteControl,
 		claudeSessionID: data.ClaudeSessionID,
 	}
 
@@ -203,8 +188,6 @@ type InstanceOptions struct {
 	AutoYes bool
 	// Branch is an existing branch name to start the session on (empty = new branch from HEAD)
 	Branch string
-	// RemoteControl starts a Claude Code session with Remote Control on.
-	RemoteControl bool
 }
 
 func NewInstance(opts InstanceOptions) (*Instance, error) {
@@ -226,7 +209,6 @@ func NewInstance(opts InstanceOptions) (*Instance, error) {
 		CreatedAt:      t,
 		UpdatedAt:      t,
 		AutoYes:        false,
-		RemoteControl:  opts.RemoteControl,
 		selectedBranch: opts.Branch,
 	}, nil
 }
@@ -248,7 +230,7 @@ func (i *Instance) IsMultiRepo() bool {
 }
 
 // InPlace reports whether the instance runs directly in Path with no git isolation at all:
-// no branch, diff or checkout. True before Start.
+// no branch or diff. True before Start.
 func (i *Instance) InPlace() bool {
 	return i.workspace == nil
 }
@@ -264,8 +246,8 @@ func IsClaudeProgram(program string) bool {
 }
 
 // launchProgram returns the command the tmux session runs: the program, plus for Claude Code
-// the session name, Remote Control, the settings writeClaudeSettings writes, the workspace's
-// arguments and launchArgs.
+// the session name, the settings writeClaudeSettings writes, the workspace's arguments and
+// launchArgs.
 func (i *Instance) launchProgram() string {
 	return i.programWith(i.launchArgs)
 }
@@ -284,9 +266,6 @@ func (i *Instance) programWith(args string) string {
 	if !i.adoptsClaudeName {
 		program += " --name " + shellQuote(i.Title)
 	}
-	if i.RemoteControl {
-		program += " --remote-control"
-	}
 	program += " " + claudestatus.Args(i.claudeDir)
 	if i.workspace != nil {
 		if args := i.workspace.ClaudeArgs(); args != "" {
@@ -300,9 +279,8 @@ func (i *Instance) programWith(args string) string {
 }
 
 // restartArgs returns the Claude Code arguments for restarting the instance after its tmux
-// session ended: --resume of the conversation it ran, if Claude Code saved it. Continuing the
-// conversation also reconnects its Remote Control session on claude.ai, so the same link
-// keeps working. Otherwise it is launchArgs, and resumed is false.
+// session ended: --resume of the conversation it ran, if Claude Code saved it. Otherwise it is
+// launchArgs, and resumed is false.
 func (i *Instance) restartArgs() (args string, resumed bool) {
 	if i.claudeDir != "" && claudestatus.HasTranscript(i.claudeSessionID) {
 		return "--resume " + shellQuote(i.claudeSessionID), true
@@ -330,6 +308,31 @@ func (i *Instance) setClaudeDir() error {
 func (i *Instance) ResumeConversation() {
 	i.launchArgs = "--resume"
 	i.adoptsClaudeName = true
+}
+
+// WidenResumePicker makes Claude Code's conversation picker in an instance that resumes a
+// conversation in a worktree list the conversations of every worktree of the repository,
+// including its main checkout. On its own the picker lists only the worktree's, and a new
+// worktree has none. It presses Ctrl+W once the picker offers that. Call it from the main
+// event loop.
+func (i *Instance) WidenResumePicker() error {
+	if !i.adoptsClaudeName || i.resumePickerWidened || !i.started || i.Status == Paused ||
+		i.tmuxSession == nil || i.workspace == nil || i.workspace.SingleRepo() == "" {
+		return nil
+	}
+	content, err := i.tmuxSession.CapturePaneContent()
+	if err != nil || !pickerOffersAllWorktrees(content) {
+		return err
+	}
+	i.resumePickerWidened = true
+	return i.SendKeys("\x17")
+}
+
+// pickerOffersAllWorktrees reports whether content, a capture of Claude Code's pane, shows its
+// conversation picker limited to the current worktree. Claude Code wraps the hint itself, so
+// the words are matched across lines.
+func pickerOffersAllWorktrees(content string) bool {
+	return strings.Contains(strings.Join(strings.Fields(content), " "), "Ctrl+W to show all worktrees")
 }
 
 // AdoptsClaudeName reports whether the instance is waiting to take the name of the
@@ -498,6 +501,9 @@ func (i *Instance) Start(firstTimeSetup bool) error {
 			ws, err = workspace.Fork(i.forkOf.workspace, i.Title)
 		case git.IsGitRepo(i.Path):
 			ws, err = workspace.NewSingle(i.Path, i.Title, i.selectedBranch)
+			if err == nil && i.adoptsClaudeName {
+				ws.ContinueConversation()
+			}
 		case i.selectedBranch != "":
 			return fmt.Errorf("cannot start on branch %q: %s is not a git repository", i.selectedBranch, i.Path)
 		// A directory of repositories gets a worktree per repository the agent changes,
@@ -570,6 +576,8 @@ func (i *Instance) Start(firstTimeSetup bool) error {
 			setupErr = err
 			return setupErr
 		}
+		// Setup may have written instructions that Claude Code's arguments name.
+		i.tmuxSession.SetProgram(i.launchProgram())
 
 		// Create new session
 		if err := i.tmuxSession.Start(i.GetWorkDir()); err != nil {
@@ -591,7 +599,6 @@ func (i *Instance) Start(firstTimeSetup bool) error {
 		i.tmuxSession.SetProgram(i.launchProgram())
 	}
 
-	i.remoteSince = time.Now()
 	i.SetStatus(Running)
 
 	return nil
@@ -654,11 +661,23 @@ func (i *Instance) combineErrors(errs []error) error {
 	return fmt.Errorf("%s", errMsg)
 }
 
+// PreviewCursor returns where the cursor of the session's pane is, in the rows Preview
+// returns, if the program shows one. Claude Code's prompt uses the terminal's own cursor,
+// which a capture of the pane leaves out, so the preview draws it from this.
+func (i *Instance) PreviewCursor() (x, y int, ok bool) {
+	if !i.started || i.Status == Paused || i.tmuxSession == nil {
+		return 0, 0, false
+	}
+	x, y, visible, err := i.tmuxSession.Cursor()
+	return x, y, err == nil && visible
+}
+
+// Preview returns what the session's pane shows, one line per row; see PreviewCursor.
 func (i *Instance) Preview() (string, error) {
 	if !i.started || i.Status == Paused {
 		return "", nil
 	}
-	content, err := i.tmuxSession.CapturePaneContent()
+	content, err := i.tmuxSession.CaptureScreen()
 	if err != nil && !i.tmuxSession.DoesSessionExist() {
 		// The program exited, taking its tmux session with it. That is no error: the next
 		// metadata tick pauses the instance.
@@ -713,20 +732,6 @@ func (i *Instance) SetPreviewSize(width, height int) error {
 	return i.tmuxSession.SetDetachedSize(width, height)
 }
 
-// IsBranchCheckedOut reports whether the instance's branch is checked out in the original
-// repository (in any of them, for a multi-repo instance). The branch can then be neither
-// deleted nor given a worktree again.
-func (i *Instance) IsBranchCheckedOut() (bool, error) {
-	if !i.started {
-		return false, fmt.Errorf("cannot check branch of instance that has not been started")
-	}
-	if i.workspace == nil {
-		return false, nil
-	}
-	repos, err := i.workspace.CheckedOutRepos()
-	return len(repos) > 0, err
-}
-
 // GetWorkDir returns the directory the agent runs in: the worktree of a single-repo
 // instance, otherwise Path.
 func (i *Instance) GetWorkDir() string {
@@ -734,6 +739,43 @@ func (i *Instance) GetWorkDir() string {
 		return i.workspace.WorktreePath(i.workspace.SingleRepo())
 	}
 	return i.Path
+}
+
+// EditorDir returns the directory to open in an editor to see the instance's work: its
+// worktree, or with several repositories changed the workspace holding their worktrees side by
+// side. An instance that runs in place has only Path.
+func (i *Instance) EditorDir() (string, error) {
+	if !i.started {
+		return "", fmt.Errorf("session '%s' has not started", i.Title)
+	}
+	if i.workspace == nil {
+		return i.Path, nil
+	}
+	if repo := i.workspace.SingleRepo(); repo != "" {
+		dir := i.workspace.WorktreePath(repo)
+		if _, err := os.Stat(dir); err != nil {
+			return "", fmt.Errorf("session '%s' has no worktree: r resumes it, which recreates it", i.Title)
+		}
+		return dir, nil
+	}
+	// What is on disk rather than repos.json: the agent may have added a worktree itself.
+	entries, err := os.ReadDir(i.workspace.Dir())
+	if err != nil {
+		return "", fmt.Errorf("could not read the workspace of session '%s': %w", i.Title, err)
+	}
+	var worktrees []string
+	for _, e := range entries {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			worktrees = append(worktrees, e.Name())
+		}
+	}
+	switch len(worktrees) {
+	case 0:
+		return "", fmt.Errorf("session '%s' has no worktree yet: it gets one per repository it changes", i.Title)
+	case 1:
+		return i.workspace.WorktreePath(worktrees[0]), nil
+	}
+	return i.workspace.Dir(), nil
 }
 
 func (i *Instance) Started() bool {
@@ -750,6 +792,21 @@ func (i *Instance) SetTitle(title string) error {
 	return nil
 }
 
+// SetPath sets the directory the instance starts in, which decides, like the launch directory
+// does, whether it gets a worktree of one repository, a worktree per changed repository, or
+// runs in place. Like the title, it cannot change once the instance has started.
+func (i *Instance) SetPath(path string) error {
+	if i.started {
+		return fmt.Errorf("cannot change the folder of a started instance")
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("failed to get absolute path: %w", err)
+	}
+	i.Path = absPath
+	return nil
+}
+
 func (i *Instance) Paused() bool {
 	return i.Status == Paused
 }
@@ -759,36 +816,8 @@ func (i *Instance) TmuxAlive() bool {
 	return i.tmuxSession.DoesSessionExist()
 }
 
-// Pause commits the changes in every worktree to its branch, removes the worktrees while
-// keeping the branches, and detaches the tmux session.
-func (i *Instance) Pause() error {
-	if !i.started {
-		return fmt.Errorf("cannot pause instance that has not been started")
-	}
-	if i.Status == Paused {
-		return fmt.Errorf("instance is already paused")
-	}
-	if i.InPlace() {
-		return fmt.Errorf("cannot check out session '%s': it is not in a git repository", i.Title)
-	}
-
-	commitMsg := fmt.Sprintf("[claudesquad] update from '%s' on %s (paused)", i.Title, time.Now().Format(time.RFC822))
-	if err := i.workspace.Pause(commitMsg); err != nil {
-		// Some worktrees may still hold uncommitted work; keep the session running.
-		log.ErrorLog.Print(err)
-		return fmt.Errorf("failed to pause workspace: %w", err)
-	}
-	// Detach from tmux session instead of closing to preserve session output
-	if err := i.tmuxSession.DetachSafely(); err != nil {
-		log.ErrorLog.Print(err)
-		return fmt.Errorf("failed to detach tmux session: %w", err)
-	}
-	i.SetStatus(Paused)
-	_ = clipboard.WriteAll(i.workspace.BranchName())
-	return nil
-}
-
-// Resume recreates the worktree and restarts the tmux session
+// Resume restarts a paused instance, whose tmux session ended: it recreates any worktree that
+// is missing, then restores or restarts the tmux session.
 func (i *Instance) Resume() error {
 	if !i.started {
 		return fmt.Errorf("cannot resume instance that has not been started")
@@ -798,20 +827,13 @@ func (i *Instance) Resume() error {
 	}
 
 	if i.workspace != nil {
-		if repos, err := i.workspace.CheckedOutRepos(); err != nil {
-			return fmt.Errorf("failed to check if branches are checked out: %w", err)
-		} else if len(repos) > 0 {
-			return fmt.Errorf("cannot resume: branch %s is checked out in %s, please switch to a different branch",
-				i.workspace.BranchName(), strings.Join(repos, ", "))
-		}
 		if err := i.workspace.Resume(); err != nil {
 			log.ErrorLog.Print(err)
 			return fmt.Errorf("failed to restore workspace: %w", err)
 		}
 	}
 
-	// Without a workspace there is nothing on disk to rebuild, only the tmux session: such an
-	// instance can only be paused by its tmux session dying, never by checkout.
+	// Without a workspace there is nothing on disk to rebuild, only the tmux session.
 
 	if err := i.writeClaudeSettings(); err != nil {
 		log.ErrorLog.Print(err)
@@ -837,7 +859,6 @@ func (i *Instance) Resume() error {
 		}
 	}
 
-	i.remoteSince = time.Now()
 	i.SetStatus(Running)
 	return nil
 }
@@ -855,6 +876,36 @@ func (i *Instance) restart() error {
 		i.resumedAt = time.Now()
 	}
 	return nil
+}
+
+// resumeGrace is how soon after a restart on an earlier conversation the session must end
+// for MarkEnded to take it that Claude Code could not continue the conversation.
+const resumeGrace = 15 * time.Second
+
+// MarkEnded pauses an instance whose tmux session ended, as when the program in it exits, so
+// it can be resumed. If it ended right after Resume restarted it on its earlier conversation,
+// Claude Code could not continue that conversation; then the next restart starts a new one,
+// and the error says so.
+func (i *Instance) MarkEnded() error {
+	i.SetStatus(Paused)
+	if i.resumedAt.IsZero() || time.Since(i.resumedAt) > resumeGrace {
+		return nil
+	}
+	i.resumedAt = time.Time{}
+	i.claudeSessionID = ""
+	return fmt.Errorf("session '%s' exited right after continuing its conversation; press r to start a new one", i.Title)
+}
+
+// SetClaudeProcess records the conversation in Claude Code's registry entry of the process in
+// the instance's tmux pane (see ComputeClaudeProcess), which a restart continues. Without an
+// entry, what was recorded stays. It reports whether the conversation changed, which is worth
+// saving. Call it from the main event loop.
+func (i *Instance) SetClaudeProcess(p *claudestatus.Process) (conversationChanged bool) {
+	if p == nil || p.SessionID == "" || p.SessionID == i.claudeSessionID {
+		return false
+	}
+	i.claudeSessionID = p.SessionID
+	return true
 }
 
 // UpdateDiffStats updates the git diff statistics for this instance

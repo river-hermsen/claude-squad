@@ -50,6 +50,12 @@ var selectedDescStyle = lipgloss.NewStyle().
 	Background(lipgloss.Color("#dde4f0")).
 	Foreground(lipgloss.AdaptiveColor{Light: "#1a1a1a", Dark: "#1a1a1a"})
 
+// typingTitleStyle and typingDescStyle draw the selected instance while keys go to it, in the
+// color of the preview's border then.
+var typingTitleStyle = selectedTitleStyle.Background(focusColor)
+
+var typingDescStyle = selectedDescStyle.Background(focusColor)
+
 var mainTitle = lipgloss.NewStyle().
 	Background(lipgloss.Color("62")).
 	Foreground(lipgloss.Color("230"))
@@ -66,27 +72,9 @@ type List struct {
 	autoyes       bool
 	// limits are the account's usage limits Claude Code reported last; nil before any did.
 	limits *claudestatus.Limits
-	// server is the state of the Remote Control server that lets the Claude app start
-	// sessions on this machine.
-	server ServerState
+	// offset is the first instance in view; see scroll.
+	offset int
 }
-
-// ServerState is the state of the Remote Control server cs keeps running, which lets the
-// Claude app start a conversation on this machine.
-type ServerState int
-
-const (
-	// ServerOff means cs runs no server.
-	ServerOff ServerState = iota
-	// ServerStarting means the server is starting or connecting.
-	ServerStarting
-	// ServerReady means the Claude app can start conversations here.
-	ServerReady
-	// ServerNeedsInput means the server waits for an answer in its terminal.
-	ServerNeedsInput
-	// ServerDown means the server stopped; cs starts it again.
-	ServerDown
-)
 
 func NewList(spinner *spinner.Model, autoYes bool) *List {
 	return &List{
@@ -128,6 +116,10 @@ func (l *List) NumInstances() int {
 type InstanceRenderer struct {
 	spinner *spinner.Model
 	width   int
+	// launchDir is the directory claude-squad runs in; see List.SetLaunchDir.
+	launchDir string
+	// typing is true while keys go to the selected instance; see List.SetTyping.
+	typing bool
 }
 
 // setWidth sets the width of a rendered item, minus the 2 columns of the item's padding.
@@ -145,13 +137,19 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, m
 	}
 	titleS := selectedTitleStyle
 	descS := selectedDescStyle
-	if !selected {
+	// While keys go to the instance, its colored details would not show on the background.
+	plain := selected && r.typing
+	switch {
+	case !selected:
 		titleS = titleStyle
 		descS = listDescStyle
+	case plain:
+		titleS = typingTitleStyle
+		descS = typingDescStyle
 	}
 
-	// The status icon, and before it the Remote Control badge, are drawn with the title's
-	// background, so a selected instance is tinted edge to edge.
+	// The status icon is drawn with the title's background, so a selected instance is tinted
+	// edge to edge.
 	bg := lipgloss.NewStyle().Background(titleS.GetBackground())
 	var join string
 	switch i.Status {
@@ -163,18 +161,16 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, m
 		join = pausedStyle.Inherit(bg).Render(pausedIcon)
 	default:
 	}
-	badge := remoteBadge(i.RemoteState(), bg)
 
 	// Cut the title if it's too long
 	titleText := i.Title
-	widthAvail := r.width - 3 - runewidth.StringWidth(prefix) - 1 - lipgloss.Width(badge)
+	widthAvail := r.width - 3 - runewidth.StringWidth(prefix) - 1
 	if widthAvail > 0 && runewidth.StringWidth(titleText) > widthAvail {
 		titleText = runewidth.Truncate(titleText, widthAvail-3, "...")
 	}
 	title := titleS.Render(lipgloss.JoinHorizontal(
 		lipgloss.Left,
-		lipgloss.Place(r.width-3-lipgloss.Width(badge), 1, lipgloss.Left, lipgloss.Center, fmt.Sprintf("%s %s", prefix, titleText)),
-		badge,
+		lipgloss.Place(r.width-3, 1, lipgloss.Left, lipgloss.Center, fmt.Sprintf("%s %s", prefix, titleText)),
 		bg.Render(" "),
 		join,
 	))
@@ -187,17 +183,32 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, m
 	stat := i.GetDiffStats()
 	var repos []git.RepoDiff
 	var counts string
+	counter := diffCounts
+	if plain {
+		counter = plainDiffCounts
+	}
 	if stat != nil && stat.Error == nil && !stat.IsEmpty() {
 		repos = stat.Repos
-		counts = diffCounts(stat.Added, stat.Removed, base)
+		counts = counter(stat.Added, stat.Removed, base)
 	}
 
 	info := agentSegments(i)
+	if plain {
+		for k := range info {
+			info[k].color = nil
+		}
+	}
 	switch {
-	case !i.Started() || i.InPlace():
-	case i.IsMultiRepo():
-		if !selected && len(repos) > 0 {
+	case !i.Started():
+		// The folder the instance being named will start in.
+		info = append([]segment{{text: filepath.Base(i.Path)}}, info...)
+	case i.InPlace() || i.IsMultiRepo():
+		if i.IsMultiRepo() && !selected && len(repos) > 0 {
 			info = append([]segment{{text: fmt.Sprintf("%d %s", len(repos), plural(len(repos), "repo", "repos"))}}, info...)
+		}
+		// A session in another folder than claude-squad's own says which.
+		if i.Path != r.launchDir {
+			info = append([]segment{{text: filepath.Base(i.Path)}}, info...)
 		}
 	default:
 		if repo, err := i.RepoName(); err == nil {
@@ -217,7 +228,7 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, m
 			more = len(repos) - len(shown)
 		}
 		for _, repo := range shown {
-			rows = append(rows, descS.Render(r.row(indent+2, []segment{{text: repo.Name}}, diffCounts(repo.Added, repo.Removed, base), base)))
+			rows = append(rows, descS.Render(r.row(indent+2, []segment{{text: repo.Name}}, counter(repo.Added, repo.Removed, base), base)))
 		}
 		if more > 0 {
 			rows = append(rows, descS.Render(r.row(indent+2, []segment{{text: fmt.Sprintf("%d more", more)}}, "", base)))
@@ -225,26 +236,6 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, m
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, rows...)
 }
-
-// remoteBadge renders a Claude session's Remote Control state with bg's background: "RC" in
-// blue while claude.ai/code and the Claude app can reach the session, dimmed while it connects
-// (or connects again once resumed), red when it failed to. It is empty while Remote Control is off.
-func remoteBadge(state session.RemoteState, bg lipgloss.Style) string {
-	var color lipgloss.TerminalColor
-	switch state {
-	case session.RemoteOn:
-		color = remoteOnColor
-	case session.RemoteStarting:
-		color = pausedStyle.GetForeground()
-	case session.RemoteFailed:
-		color = removedLinesStyle.GetForeground()
-	default:
-		return ""
-	}
-	return bg.Bold(true).Foreground(color).Render("RC")
-}
-
-var remoteOnColor = lipgloss.Color("#4aa3df")
 
 // segment is a piece of an instance row, drawn in color or else in the row's own color.
 type segment struct {
@@ -315,6 +306,11 @@ func diffCounts(added, removed int, base lipgloss.Style) string {
 		base.Render(",") +
 		removedLinesStyle.Background(bg).Render(fmt.Sprintf("-%d", removed)) +
 		base.Render(" ")
+}
+
+// plainDiffCounts is diffCounts in base's own color.
+func plainDiffCounts(added, removed int, base lipgloss.Style) string {
+	return base.Render(fmt.Sprintf("+%d,-%d ", added, removed))
 }
 
 // agentSegments describes the agent: the model, context use and effort Claude Code last
@@ -390,65 +386,102 @@ func (l *List) String() string {
 		badge = " " + autoYesStyle.Render(autoYesText)
 	}
 	room := titleWidth - lipgloss.Width(title) - lipgloss.Width(badge) - 2
-	// The server's state goes first; the limits get what room is left.
-	server := renderServer(l.server)
-	if lipgloss.Width(server) > room {
-		server = ""
-	}
-	sep := listDescStyle.UnsetPadding().Render(" · ")
-	limits := renderLimits(l.limits, time.Now(), room-lipgloss.Width(server)-lipgloss.Width(sep))
-	right := server + badge
-	switch {
-	case server != "" && limits != "":
-		right = server + sep + limits + badge
-	case limits != "":
-		right = limits + badge
-	}
+	right := renderLimits(l.limits, time.Now(), room) + badge
 	b.WriteString(title)
 	if pad := titleWidth - lipgloss.Width(title) - lipgloss.Width(right); pad > 0 {
 		b.WriteString(strings.Repeat(" ", pad))
 	}
 	b.WriteString(right)
-
-	b.WriteString("\n")
 	b.WriteString("\n")
 
-	// The selected instance's repository rows get whatever height the list has left: the
-	// title takes 3 rows, every instance 2 plus a blank row between them.
-	maxRepoRows := max(l.height-3-3*len(l.items)+1, 1)
+	// The title takes 3 rows, every instance 2 plus a blank row between them. The selected
+	// instance's repository rows get whatever height the list has left, and at least a third
+	// of it, for which the list scrolls.
+	avail := l.height - 3
+	maxRepoRows := max(avail-(3*len(l.items)-1), max(avail/3, 1))
 
-	// Render the list.
-	for i, item := range l.items {
-		b.WriteString(l.renderer.Render(item, i+1, i == l.selectedIdx, maxRepoRows))
-		if i != len(l.items)-1 {
+	var selected string
+	heights := make([]int, len(l.items))
+	for i := range l.items {
+		heights[i] = 2
+		if i == l.selectedIdx {
+			selected = l.renderer.Render(l.items[i], i+1, true, maxRepoRows)
+			heights[i] = lipgloss.Height(selected)
+		}
+	}
+	first, last := l.scroll(heights, avail)
+
+	// The row under the title, and the row after the last instance in view, say how many
+	// instances are out of view.
+	if first > 0 {
+		b.WriteString(listDescStyle.Render(fmt.Sprintf(" ↑ %d more", first)))
+	}
+	b.WriteString("\n")
+	for i := first; i <= last && i < len(l.items); i++ {
+		if i == l.selectedIdx {
+			b.WriteString(selected)
+		} else {
+			b.WriteString(l.renderer.Render(l.items[i], i+1, false, maxRepoRows))
+		}
+		if i != last {
 			b.WriteString("\n\n")
 		}
 	}
-	return lipgloss.Place(l.width, l.height, lipgloss.Left, lipgloss.Top,
-		lipgloss.NewStyle().PaddingLeft(1).Render(b.String()))
-}
-
-// SetServer sets the state of the Remote Control server shown in the title row.
-func (l *List) SetServer(state ServerState) {
-	l.server = state
-}
-
-// renderServer renders the Remote Control server's state as "server": blue while the
-// Claude app can start conversations here, dimmed while it starts, red when it needs an
-// answer or stopped. It is empty without a server.
-func renderServer(state ServerState) string {
-	var color lipgloss.TerminalColor
-	switch state {
-	case ServerReady:
-		color = remoteOnColor
-	case ServerStarting:
-		color = pausedStyle.GetForeground()
-	case ServerNeedsInput, ServerDown:
-		color = removedLinesStyle.GetForeground()
-	default:
-		return ""
+	if more := len(l.items) - 1 - last; more > 0 {
+		b.WriteString("\n" + listDescStyle.Render(fmt.Sprintf(" ↓ %d more", more)))
 	}
-	return lipgloss.NewStyle().Foreground(color).Render("server")
+
+	// An instance taller than the whole list is cut off.
+	rows := strings.Split(lipgloss.NewStyle().PaddingLeft(1).Render(b.String()), "\n")
+	rows = rows[:min(len(rows), max(l.height, 1))]
+	return lipgloss.Place(l.width, l.height, lipgloss.Left, lipgloss.Top, strings.Join(rows, "\n"))
+}
+
+// scroll moves offset as little as it can to show the selected instance in avail rows, given
+// every instance's height, and returns the first and last instance in view. A blank row goes
+// between instances, and a row saying how many more follow goes after the last one in view.
+func (l *List) scroll(heights []int, avail int) (first, last int) {
+	n := len(heights)
+	if n == 0 {
+		l.offset = 0
+		return 0, -1
+	}
+	rows := func(first, last int) int {
+		r := last - first
+		for _, h := range heights[first : last+1] {
+			r += h
+		}
+		if last < n-1 {
+			r++
+		}
+		return r
+	}
+	selected := min(max(l.selectedIdx, 0), n-1)
+	l.offset = min(max(l.offset, 0), selected)
+	for l.offset < selected && rows(l.offset, selected) > avail {
+		l.offset++
+	}
+	// Once the list has room, as after a kill or a taller window, the instances above come back.
+	for l.offset > 0 && rows(l.offset-1, n-1) <= avail {
+		l.offset--
+	}
+	last = selected
+	for last < n-1 && rows(l.offset, last+1) <= avail {
+		last++
+	}
+	return l.offset, last
+}
+
+// SetTyping marks the selected instance as receiving keys, which draws it in the color of the
+// preview's border.
+func (l *List) SetTyping(typing bool) {
+	l.renderer.typing = typing
+}
+
+// SetLaunchDir sets the directory claude-squad runs in. Instances that run in place or across
+// a directory of repositories elsewhere show their folder's name.
+func (l *List) SetLaunchDir(dir string) {
+	l.renderer.launchDir = dir
 }
 
 // SetLimits sets the account's usage limits shown in the title row.

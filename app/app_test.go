@@ -30,6 +30,25 @@ func TestMain(m *testing.M) {
 	os.Exit(exitCode)
 }
 
+// newTestHome returns a home with an empty list, saving to a state under a temporary HOME.
+func newTestHome(t *testing.T) *home {
+	t.Setenv("HOME", t.TempDir())
+	state := config.LoadState()
+	storage, err := session.NewStorage(state)
+	require.NoError(t, err)
+	s := spinner.New()
+	return &home{
+		ctx:          context.Background(),
+		state:        stateDefault,
+		appConfig:    config.DefaultConfig(),
+		storage:      storage,
+		list:         ui.NewList(&s, false),
+		menu:         ui.NewMenu(),
+		tabbedWindow: ui.NewTabbedWindow(ui.NewPreviewPane(), ui.NewDiffPane(), ui.NewTerminalPane()),
+		errBox:       ui.NewErrBox(),
+	}
+}
+
 // TestConfirmationModalStateTransitions tests state transitions without full instance setup
 func TestConfirmationModalStateTransitions(t *testing.T) {
 	// Create a minimal home struct for testing state transitions

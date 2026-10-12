@@ -23,7 +23,7 @@ import (
 	"github.com/mattn/go-runewidth"
 )
 
-const GlobalInstanceLimit = 10
+const GlobalInstanceLimit = 20
 
 // Run is the main entrypoint into the application. With mouse, cs takes mouse events, for wheel
 // scrolling; otherwise the terminal keeps the mouse for its own selection, copy and paste.
@@ -73,8 +73,8 @@ const (
 	stateInput
 	// stateFocus is the state when keys go to the selected session, shown in the preview.
 	stateFocus
-	// stateRemote is the state when remoteOverlay shows a session's Remote Control link.
-	stateRemote
+	// stateFolder is the state when folderPicker asks for the folder a session starts in.
+	stateFolder
 )
 
 type home struct {
@@ -84,9 +84,9 @@ type home struct {
 
 	program string
 	autoYes bool
-	// inGitRepo is true if claude-squad was started inside a git repository. New instances
-	// get a worktree and branch picker only then; otherwise they run in the current directory.
-	inGitRepo bool
+	// launchDir is the directory claude-squad was started in. New instances start there unless
+	// another folder is picked for them while they are named.
+	launchDir string
 
 	// storage is the interface for saving/loading data to/from the app's state
 	storage *session.Storage
@@ -132,19 +132,16 @@ type home struct {
 	// inputOverlay asks for a line of text in stateInput, which onInputSubmit then gets.
 	inputOverlay  *overlay.InputOverlay
 	onInputSubmit func(value string) tea.Cmd
-	// remoteOverlay shows remoteInstance's Remote Control link in stateRemote.
-	remoteOverlay  *overlay.RemoteControlOverlay
-	remoteInstance *session.Instance
+	// folderPicker asks for the folder a session starts in, in stateFolder, and passes it to
+	// onFolderPick, or calls onFolderCancel.
+	folderPicker   *overlay.FolderPicker
+	onFolderPick   func(dir string) tea.Cmd
+	onFolderCancel func() tea.Cmd
 
-	// windowHeight is the terminal's height.
-	windowHeight int
+	// windowWidth and windowHeight are the terminal's size.
+	windowWidth, windowHeight int
 	// selectionHintAt is when selectionHint last showed.
 	selectionHintAt time.Time
-
-	// server is the Remote Control server that lets the Claude app start sessions here, or nil;
-	// serverState is its state as last checked.
-	server      *remoteServer
-	serverState ui.ServerState
 }
 
 func newHome(ctx context.Context, program string, autoYes bool) *home {
@@ -177,12 +174,13 @@ func newHome(ctx context.Context, program string, autoYes bool) *home {
 		appConfig:    appConfig,
 		program:      program,
 		autoYes:      autoYes,
-		inGitRepo:    git.IsGitRepo(currentDir),
+		launchDir:    currentDir,
 		state:        stateDefault,
 		appState:     appState,
 	}
 	h.list = ui.NewList(&h.spinner, autoYes)
 	h.list.SetLimits(readLimits())
+	h.list.SetLaunchDir(currentDir)
 
 	// Load saved instances
 	instances, err := storage.LoadInstances()
@@ -198,21 +196,6 @@ func newHome(ctx context.Context, program string, autoYes bool) *home {
 			instance.AutoYes = true
 		}
 	}
-	// Sessions `cs new` started while no TUI ran.
-	if items, err := session.ReadInbox(); err == nil {
-		h.adoptInbox(items)
-	}
-
-	if appConfig.RemoteServerEnabled() {
-		h.server = newRemoteServer(currentDir, program)
-	}
-	if h.server != nil {
-		if csPath, err := os.Executable(); err == nil {
-			if err := installSkill(csPath); err != nil {
-				log.WarningLog.Printf("could not install the claude-squad skill: %v", err)
-			}
-		}
-	}
 
 	return h
 }
@@ -220,7 +203,7 @@ func newHome(ctx context.Context, program string, autoYes bool) *home {
 // updateHandleWindowSizeEvent sets the sizes of the components.
 // The components will try to render inside their bounds.
 func (m *home) updateHandleWindowSizeEvent(msg tea.WindowSizeMsg) {
-	m.windowHeight = msg.Height
+	m.windowWidth, m.windowHeight = msg.Width, msg.Height
 	// List takes 30% of width, preview takes 70%
 	listWidth := int(float32(msg.Width) * 0.3)
 	tabsWidth := msg.Width - listWidth
@@ -257,7 +240,7 @@ func (m *home) Init() tea.Cmd {
 			time.Sleep(100 * time.Millisecond)
 			return previewTickMsg{}
 		},
-		tickUpdateMetadataCmd(m.snapshotActiveInstances(), m.list.GetSelectedInstance(), m.server),
+		tickUpdateMetadataCmd(m.snapshotActiveInstances(), m.list.GetSelectedInstance()),
 	)
 }
 
@@ -339,14 +322,12 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				r.instance.TapEnter()
 			} else {
 				r.instance.SetStatus(session.Ready)
-				// A renamed Claude session takes its new name once it is idle, and one that was
-				// asked to then turns on Remote Control, one command per tick.
-				if sent, err := r.instance.SyncClaudeName(); err != nil {
+				if err := r.instance.WidenResumePicker(); err != nil {
+					log.WarningLog.Printf("could not widen the conversation picker: %v", err)
+				}
+				// A renamed Claude session takes its new name once it is idle.
+				if _, err := r.instance.SyncClaudeName(); err != nil {
 					log.WarningLog.Printf("could not rename Claude session: %v", err)
-				} else if !sent {
-					if _, err := r.instance.SyncRemoteControl(); err != nil {
-						log.WarningLog.Printf("could not turn on Remote Control: %v", err)
-					}
 				}
 			}
 			if r.diffStats != nil && r.diffStats.Error != nil {
@@ -369,13 +350,7 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				log.ErrorLog.Printf("could not save instances: %v", err)
 			}
 		}
-		if m.canAdoptInbox() && m.adoptInbox(msg.inbox) {
-			cmds = append(cmds, tea.WindowSize(), m.instanceChanged())
-		}
-		if m.server != nil {
-			cmds = append(cmds, m.setServerState(msg.serverState, msg.serverProblem))
-		}
-		cmds = append(cmds, tickUpdateMetadataCmd(m.snapshotActiveInstances(), m.list.GetSelectedInstance(), m.server))
+		cmds = append(cmds, tickUpdateMetadataCmd(m.snapshotActiveInstances(), m.list.GetSelectedInstance()))
 		return m, tea.Batch(cmds...)
 	case tea.MouseMsg:
 		// cs takes the mouse for the wheel, so a plain drag selects nothing; say how to.
@@ -412,7 +387,11 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.version != m.textInputOverlay.BranchFilterVersion() {
 			return m, nil // stale, a newer debounce is pending
 		}
-		return m, m.runBranchSearch(msg.filter, msg.version)
+		selected := m.list.GetSelectedInstance()
+		if selected == nil {
+			return m, nil
+		}
+		return m, m.runBranchSearch(selected.Path, msg.filter, msg.version)
 	case branchSearchResultMsg:
 		if m.textInputOverlay != nil {
 			m.textInputOverlay.SetBranchResults(msg.branches, msg.version)
@@ -429,6 +408,8 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case instanceChangedMsg:
 		// Handle instance changed after confirmation action
 		return m, m.instanceChanged()
+	case editorOpenedMsg:
+		return m, m.showInfo("Opened " + msg.dir + " in VS Code")
 	case instanceStartedMsg:
 		// Select the instance that just started (or failed)
 		m.list.SelectInstance(msg.instance)
@@ -449,7 +430,7 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.promptAfterName {
 			m.state = statePrompt
 			m.menu.SetState(ui.StatePrompt)
-			m.textInputOverlay = m.newPromptOverlay()
+			m.textInputOverlay = m.newPromptOverlay(git.IsGitRepo(msg.instance.Path))
 		} else if msg.instance.AdoptsClaudeName() {
 			// Keys go straight to Claude's conversation picker.
 			m.menu.SetState(ui.StateDefault)
@@ -514,6 +495,12 @@ func (m *home) handleMenuHighlighting(msg tea.KeyMsg) (cmd tea.Cmd, returnEarly 
 	if name == keys.KeyEnter && m.state == stateNew {
 		name = keys.KeySubmitName
 	}
+	if name == keys.KeyTab && m.state == stateNew {
+		name = keys.KeyFolder
+	}
+	if name == keys.KeyNextRepo && !ui.ArrowsSwitchRepos(m.tabbedWindow.GetActiveTab(), m.list.GetSelectedInstance()) {
+		name = keys.KeyFocusRight
+	}
 	m.keySent = true
 	return tea.Batch(
 		func() tea.Msg { return msg },
@@ -526,8 +513,8 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		return m.handleFocusKey(msg)
 	case stateInput:
 		return m.handleInputKey(msg)
-	case stateRemote:
-		return m.handleRemoteKey(msg)
+	case stateFolder:
+		return m.handleFolderKey(msg)
 	}
 
 	cmd, returnEarly := m.handleMenuHighlighting(msg)
@@ -567,12 +554,13 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 				m.promptAfterName = false
 				m.state = statePrompt
 				m.menu.SetState(ui.StatePrompt)
-				m.textInputOverlay = m.newPromptOverlay()
-				if !m.inGitRepo {
+				inRepo := git.IsGitRepo(instance.Path)
+				m.textInputOverlay = m.newPromptOverlay(inRepo)
+				if !inRepo {
 					return m, tea.WindowSize()
 				}
 				// Trigger initial branch search (no debounce, version 0)
-				initialSearch := m.runBranchSearch("", m.textInputOverlay.BranchFilterVersion())
+				initialSearch := m.runBranchSearch(instance.Path, "", m.textInputOverlay.BranchFilterVersion())
 				return m, tea.Batch(tea.WindowSize(), initialSearch)
 			}
 
@@ -592,6 +580,9 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			}
 
 			return m, tea.Batch(tea.WindowSize(), m.instanceChanged(), startCmd)
+		case tea.KeyTab:
+			m.pickFolder(instance)
+			return m, nil
 		case tea.KeyRunes:
 			if runewidth.StringWidth(instance.Title) >= 32 {
 				return m, m.handleError(fmt.Errorf("title cannot be longer than 32 characters"))
@@ -759,21 +750,10 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 				fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
 		}
 
-		// Start a background fetch so branches are up to date by the time the picker opens
-		var fetchCmd tea.Cmd
-		if m.inGitRepo {
-			fetchCmd = func() tea.Msg {
-				currentDir, _ := os.Getwd()
-				git.FetchBranches(currentDir)
-				return nil
-			}
-		}
-
 		instance, err := session.NewInstance(session.InstanceOptions{
-			Title:         "",
-			Path:          ".",
-			Program:       m.program,
-			RemoteControl: m.appConfig.RemoteControlEnabled(),
+			Title:   "",
+			Path:    ".",
+			Program: m.program,
 		})
 		if err != nil {
 			return m, m.handleError(err)
@@ -785,17 +765,17 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		m.menu.SetState(ui.StateNewInstance)
 		m.promptAfterName = true
 
-		return m, fetchCmd
+		// Branches are up to date by the time the picker opens.
+		return m, fetchBranchesCmd(instance.Path)
 	case keys.KeyNew:
 		if m.list.NumInstances() >= GlobalInstanceLimit {
 			return m, m.handleError(
 				fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
 		}
 		instance, err := session.NewInstance(session.InstanceOptions{
-			Title:         "",
-			Path:          ".",
-			Program:       m.program,
-			RemoteControl: m.appConfig.RemoteControlEnabled(),
+			Title:   "",
+			Path:    ".",
+			Program: m.program,
 		})
 		if err != nil {
 			return m, m.handleError(err)
@@ -825,7 +805,11 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		}
 		return m, m.instanceChanged()
 	case keys.KeyPrevRepo, keys.KeyNextRepo:
-		if !m.tabbedWindow.IsInDiffTab() {
+		if !ui.ArrowsSwitchRepos(m.tabbedWindow.GetActiveTab(), m.list.GetSelectedInstance()) {
+			// → types into the session, as ` does.
+			if name == keys.KeyNextRepo {
+				return m.startTyping()
+			}
 			return m, nil
 		}
 		delta := 1
@@ -846,16 +830,6 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 
 		// Create the kill action as a tea.Cmd
 		killAction := func() tea.Msg {
-			// Check if branch is checked out
-			checkedOut, err := selected.IsBranchCheckedOut()
-			if err != nil {
-				return err
-			}
-
-			if checkedOut {
-				return fmt.Errorf("instance %s is currently checked out", selected.Title)
-			}
-
 			// Clean up terminal session for this instance
 			m.tabbedWindow.CleanupTerminalForInstance(selected.Title)
 
@@ -872,24 +846,6 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		// Show confirmation modal
 		message := fmt.Sprintf("[!] Kill session '%s'?", selected.Title)
 		return m, m.confirmAction(message, killAction)
-	case keys.KeyCheckout:
-		selected := m.list.GetSelectedInstance()
-		if selected == nil || selected.Status == session.Loading {
-			return m, nil
-		}
-		if selected.InPlace() {
-			return m, m.handleError(fmt.Errorf("cannot check out session '%s': it is not in a git repository", selected.Title))
-		}
-
-		// Show help screen before pausing
-		m.showHelpScreen(helpTypeInstanceCheckout{}, func() {
-			if err := selected.Pause(); err != nil {
-				m.handleError(err)
-			}
-			m.tabbedWindow.CleanupTerminalForInstance(selected.Title)
-			m.instanceChanged()
-		})
-		return m, nil
 	case keys.KeyMoveUp:
 		if m.list.MoveUp() {
 			if err := m.storage.SaveInstances(m.list.GetInstances()); err != nil {
@@ -941,48 +897,17 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		if !session.IsClaudeProgram(m.program) {
 			return m, m.handleError(fmt.Errorf("resuming a conversation needs Claude Code as the program, not %q", m.program))
 		}
-		// The instance is named after the conversation picked in Claude's picker; until
-		// then it has a placeholder name.
-		instance, err := session.NewInstance(session.InstanceOptions{
-			Title:         m.uniqueTitle("resume"),
-			Path:          ".",
-			Program:       m.program,
-			RemoteControl: m.appConfig.RemoteControlEnabled(),
-		})
-		if err != nil {
-			return m, m.handleError(err)
-		}
-		instance.ResumeConversation()
-		m.list.AddInstance(instance)
-		m.list.SelectInstance(instance)
-		instance.SetStatus(session.Loading)
-		start := func() tea.Msg {
-			return instanceStartedMsg{instance: instance, err: instance.Start(true)}
-		}
-		return m, tea.Batch(tea.WindowSize(), m.instanceChanged(), start)
+		// Claude's picker lists the conversations of the folder the session starts in.
+		m.askFolder("Continue a Claude conversation from", m.launchDir, m.resumeConversation, func() tea.Cmd { return nil })
+		return m, nil
 	case keys.KeyFocus:
+		return m.startTyping()
+	case keys.KeyEditor:
 		selected := m.list.GetSelectedInstance()
-		if selected == nil || !selected.Started() || selected.Paused() || selected.Status == session.Loading || !selected.TmuxAlive() {
+		if selected == nil || selected.Status == session.Loading {
 			return m, nil
 		}
-		// Keys go to the session shown in the preview.
-		if !m.tabbedWindow.IsInPreviewTab() {
-			m.tabbedWindow.SetActiveTab(ui.PreviewTab)
-			m.menu.SetActiveTab(ui.PreviewTab)
-		}
-		if m.tabbedWindow.IsPreviewInScrollMode() {
-			if err := m.tabbedWindow.ResetPreviewToNormalMode(selected); err != nil {
-				return m, m.handleError(err)
-			}
-		}
-		m.state = stateFocus
-		return m, m.instanceChanged()
-	case keys.KeyRemote:
-		selected := m.list.GetSelectedInstance()
-		if selected == nil || !selected.Started() || selected.Status == session.Loading {
-			return m, nil
-		}
-		return m, m.remoteControl(selected)
+		return m, m.openEditor(selected)
 	case keys.KeyResume:
 		selected := m.list.GetSelectedInstance()
 		if selected == nil || selected.Status == session.Loading {
@@ -1032,6 +957,26 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 	default:
 		return m, nil
 	}
+}
+
+// startTyping sends the keys that follow to the selected session, shown in the preview, until
+// KeyFocus is pressed again.
+func (m *home) startTyping() (tea.Model, tea.Cmd) {
+	selected := m.list.GetSelectedInstance()
+	if selected == nil || !selected.Started() || selected.Paused() || selected.Status == session.Loading || !selected.TmuxAlive() {
+		return m, nil
+	}
+	if !m.tabbedWindow.IsInPreviewTab() {
+		m.tabbedWindow.SetActiveTab(ui.PreviewTab)
+		m.menu.SetActiveTab(ui.PreviewTab)
+	}
+	if m.tabbedWindow.IsPreviewInScrollMode() {
+		if err := m.tabbedWindow.ResetPreviewToNormalMode(selected); err != nil {
+			return m, m.handleError(err)
+		}
+	}
+	m.state = stateFocus
+	return m, m.instanceChanged()
 }
 
 // handleFocusKey sends a key to the selected session, or with KeyFocus stops doing so.
@@ -1126,15 +1071,18 @@ func (m *home) uniqueTitle(name string) string {
 }
 
 // uniqueTitleFor is uniqueTitle for naming self, an instance whose own title does not count
-// as taken.
+// as taken. A tmux session of that name, left by another cs, takes a title too.
 func (m *home) uniqueTitleFor(self *session.Instance, name string) string {
 	return session.UniqueTitle(name, func(title string) bool {
+		if self != nil && title == self.Title {
+			return false
+		}
 		for _, inst := range m.list.GetInstances() {
-			if inst != self && inst.Title == title {
+			if inst.Title == title {
 				return true
 			}
 		}
-		return false
+		return tmux.NewTmuxSession(title, "").DoesSessionExist()
 	})
 }
 
@@ -1152,6 +1100,29 @@ func (m *home) adoptClaudeName(inst *session.Instance, claudeName string) {
 	}
 }
 
+// resumeConversation starts an instance in dir that opens Claude's picker of the conversations
+// to continue there.
+func (m *home) resumeConversation(dir string) tea.Cmd {
+	// The instance is named after the conversation picked in Claude's picker; until then it
+	// has a placeholder name.
+	instance, err := session.NewInstance(session.InstanceOptions{
+		Title:   m.uniqueTitle("resume"),
+		Path:    dir,
+		Program: m.program,
+	})
+	if err != nil {
+		return m.handleError(err)
+	}
+	instance.ResumeConversation()
+	m.list.AddInstance(instance)
+	m.list.SelectInstance(instance)
+	instance.SetStatus(session.Loading)
+	start := func() tea.Msg {
+		return instanceStartedMsg{instance: instance, err: instance.Start(true)}
+	}
+	return tea.Batch(tea.WindowSize(), m.instanceChanged(), start)
+}
+
 func (m *home) forkInstance(src *session.Instance, title string) tea.Cmd {
 	if err := m.validateTitle(title, nil); err != nil {
 		return m.handleError(err)
@@ -1160,7 +1131,6 @@ func (m *home) forkInstance(src *session.Instance, title string) tea.Cmd {
 	if err != nil {
 		return m.handleError(err)
 	}
-	fork.RemoteControl = m.appConfig.RemoteControlEnabled()
 	m.list.AddInstance(fork)
 	m.list.SelectInstance(fork)
 	fork.SetStatus(session.Loading)
@@ -1246,11 +1216,11 @@ func (m *home) scheduleBranchSearch(filter string, version uint64) tea.Cmd {
 	}
 }
 
-// runBranchSearch returns a tea.Cmd that performs the git search in the background.
-func (m *home) runBranchSearch(filter string, version uint64) tea.Cmd {
+// runBranchSearch returns a tea.Cmd that searches the branches of the repository in dir in
+// the background.
+func (m *home) runBranchSearch(dir string, filter string, version uint64) tea.Cmd {
 	return func() tea.Msg {
-		currentDir, _ := os.Getwd()
-		branches, err := git.SearchBranches(currentDir, filter)
+		branches, err := git.SearchBranches(dir, filter)
 		if err != nil {
 			log.WarningLog.Printf("branch search failed: %v", err)
 			return nil
@@ -1278,12 +1248,6 @@ type metadataUpdateDoneMsg struct {
 	results []instanceMetaResult
 	// limits are the account's usage limits Claude Code reported last, or nil.
 	limits *claudestatus.Limits
-	// inbox holds the sessions `cs new` started that the list does not have yet.
-	inbox []session.InboxItem
-	// serverState is the Remote Control server's state, and serverProblem what it printed
-	// last when it needs an answer or stopped.
-	serverState   ui.ServerState
-	serverProblem string
 }
 
 // instanceStartDoneMsg is sent when the background instance start completes.
@@ -1323,15 +1287,11 @@ func (m *home) snapshotActiveInstances() []*session.Instance {
 // Only the selected instance gets a full diff (with Content); the rest get a
 // lightweight numstat-only summary. This keeps per-instance memory bounded
 // since the diff pane only ever renders the selected one.
-func tickUpdateMetadataCmd(active []*session.Instance, selected *session.Instance, server *remoteServer) tea.Cmd {
+func tickUpdateMetadataCmd(active []*session.Instance, selected *session.Instance) tea.Cmd {
 	return func() tea.Msg {
 		time.Sleep(500 * time.Millisecond)
 
 		done := metadataUpdateDoneMsg{limits: readLimits()}
-		done.inbox, _ = session.ReadInbox()
-		if server != nil {
-			done.serverState, done.serverProblem = server.check()
-		}
 		if len(active) == 0 {
 			return done
 		}
@@ -1409,8 +1369,10 @@ func (m *home) showInfo(msg string) tea.Cmd {
 	}
 }
 
-func (m *home) newPromptOverlay() *overlay.TextInputOverlay {
-	if !m.inGitRepo {
+// newPromptOverlay returns the overlay that asks for a new instance's first prompt, with a
+// branch picker if the instance starts in a git repository.
+func (m *home) newPromptOverlay(inRepo bool) *overlay.TextInputOverlay {
+	if !inRepo {
 		return overlay.NewTextInputOverlayWithProfilePicker("Enter prompt", "", m.appConfig.GetProfiles())
 	}
 	return overlay.NewTextInputOverlayWithBranchPicker("Enter prompt", "", m.appConfig.GetProfiles())
@@ -1461,6 +1423,7 @@ func (m *home) confirmAction(message string, action tea.Cmd) tea.Cmd {
 func (m *home) View() string {
 	m.tabbedWindow.SetFocused(m.state == stateFocus)
 	m.menu.SetFocusMode(m.state == stateFocus)
+	m.list.SetTyping(m.state == stateFocus)
 
 	listWithPadding := lipgloss.NewStyle().PaddingTop(1).Render(m.list.String())
 	previewWithPadding := lipgloss.NewStyle().PaddingTop(1).Render(m.tabbedWindow.String())
@@ -1490,8 +1453,8 @@ func (m *home) View() string {
 		return overlay.PlaceOverlay(0, 0, m.confirmationOverlay.Render(), mainView, true, true)
 	} else if m.state == stateInput {
 		return overlay.PlaceOverlay(0, 0, m.inputOverlay.Render(), mainView, true, true)
-	} else if m.state == stateRemote {
-		return overlay.PlaceOverlay(0, 0, m.remoteOverlay.Render(), mainView, true, true)
+	} else if m.state == stateFolder {
+		return overlay.PlaceOverlay(0, 0, m.folderPicker.Render(), mainView, true, true)
 	}
 
 	return mainView
