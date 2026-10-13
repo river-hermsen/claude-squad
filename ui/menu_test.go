@@ -3,6 +3,7 @@ package ui
 import (
 	"claude-squad/keys"
 	"claude-squad/session"
+	"claude-squad/session/claudestatus"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -44,6 +45,24 @@ func TestMenuDropsDescriptionsWhenTooWide(t *testing.T) {
 
 	m.SetSize(100, 1)
 	require.Contains(t, m.String(), "n • C • D • R • f │ ↵/o open • →/` type • v vs code │ tab • J/K │ ? • q")
+}
+
+// A session on an older Claude Code than the installed one offers to update it.
+func TestMenuOffersUpdate(t *testing.T) {
+	instance, err := session.FromInstanceData(session.InstanceData{
+		Title: "inplace", Path: t.TempDir(), Status: session.Paused, Program: "claude",
+	})
+	require.NoError(t, err)
+	instance.SetStatus(session.Ready)
+	instance.SetClaudeProcess(&claudestatus.Process{Version: "2.1.296"})
+
+	m := NewMenu()
+	m.SetInstance(instance)
+	require.NotContains(t, m.options, keys.KeyUpdate)
+
+	instance.SetInstalledClaudeVersion("2.1.297")
+	m.SetInstance(instance)
+	require.Contains(t, m.options, keys.KeyUpdate)
 }
 
 // → types into the session, except in the diff tab of a session that changed several

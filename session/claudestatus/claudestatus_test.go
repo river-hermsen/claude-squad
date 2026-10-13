@@ -207,11 +207,13 @@ func TestReadProcess(t *testing.T) {
 	claudeDir := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", claudeDir)
 	writeSettings(t, filepath.Join(claudeDir, "sessions", "3419664.json"),
-		`{"pid":3419664,"sessionId":"4a7c77ad-4cc4-41ae-bb7a-a51f0832c95e","kind":"interactive"}`)
+		`{"pid":3419664,"sessionId":"4a7c77ad-4cc4-41ae-bb7a-a51f0832c95e","version":"2.1.296","kind":"interactive","status":"idle"}`)
 
 	p := ReadProcess(3419664)
 	require.NotNil(t, p)
 	require.Equal(t, "4a7c77ad-4cc4-41ae-bb7a-a51f0832c95e", p.SessionID)
+	require.Equal(t, "2.1.296", p.Version)
+	require.Equal(t, "idle", p.Status)
 	require.Nil(t, ReadProcess(1))
 	require.Nil(t, ReadProcess(0))
 }

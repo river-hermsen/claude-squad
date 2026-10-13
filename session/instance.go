@@ -92,6 +92,13 @@ type Instance struct {
 	// resumedAt is when Resume last restarted the instance on claudeSessionID, or zero if it
 	// started it afresh; see MarkEnded.
 	resumedAt time.Time
+	// claudeProcess is Claude Code's registry entry of the process in the tmux pane as last
+	// read, or nil while none is known.
+	claudeProcess *claudestatus.Process
+	// installedClaude is the version of Claude Code a restart would run; see UpdateAvailable.
+	installedClaude string
+	// restarting is true from StopForRestart until FinishRestart.
+	restarting bool
 }
 
 // ToInstanceData converts an Instance to its serializable form
@@ -888,6 +895,7 @@ const resumeGrace = 15 * time.Second
 // and the error says so.
 func (i *Instance) MarkEnded() error {
 	i.SetStatus(Paused)
+	i.claudeProcess = nil
 	if i.resumedAt.IsZero() || time.Since(i.resumedAt) > resumeGrace {
 		return nil
 	}
@@ -896,12 +904,16 @@ func (i *Instance) MarkEnded() error {
 	return fmt.Errorf("session '%s' exited right after continuing its conversation; press r to start a new one", i.Title)
 }
 
-// SetClaudeProcess records the conversation in Claude Code's registry entry of the process in
-// the instance's tmux pane (see ComputeClaudeProcess), which a restart continues. Without an
-// entry, what was recorded stays. It reports whether the conversation changed, which is worth
-// saving. Call it from the main event loop.
+// SetClaudeProcess records Claude Code's registry entry of the process in the instance's tmux
+// pane (see ComputeClaudeProcess): its version and activity, and the conversation, which a
+// restart continues. Without an entry, what was recorded stays. It reports whether the
+// conversation changed, which is worth saving. Call it from the main event loop.
 func (i *Instance) SetClaudeProcess(p *claudestatus.Process) (conversationChanged bool) {
-	if p == nil || p.SessionID == "" || p.SessionID == i.claudeSessionID {
+	if p == nil {
+		return false
+	}
+	i.claudeProcess = p
+	if p.SessionID == "" || p.SessionID == i.claudeSessionID {
 		return false
 	}
 	i.claudeSessionID = p.SessionID

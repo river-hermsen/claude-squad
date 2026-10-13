@@ -321,3 +321,16 @@ func TestListScrollsToSelected(t *testing.T) {
 	require.NotContains(t, out, "↑")
 	require.NotContains(t, out, "↓")
 }
+
+// A session on an older Claude Code than the installed one says an update is waiting.
+func TestRenderUpdateAvailable(t *testing.T) {
+	inst := newRenderTestInstance(t, "claude", nil)
+	inst.SetDiffStats(nil)
+	inst.SetClaudeProcess(&claudestatus.Process{Version: "2.1.296"})
+	rows := renderRows(t, inst, 60, false, 10)
+	require.Equal(t, "      Opus 4.7 · 92.1k/1M · xhigh", strings.TrimRight(rows[1], " "), "installed version unknown")
+
+	inst.SetInstalledClaudeVersion("2.1.297")
+	rows = renderRows(t, inst, 60, false, 10)
+	require.Equal(t, "      Opus 4.7 · 92.1k/1M · xhigh · ⬆ update", strings.TrimRight(rows[1], " "))
+}

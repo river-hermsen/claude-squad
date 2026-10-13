@@ -176,6 +176,9 @@ func (m *Menu) addInstanceOptions() {
 		}
 	}
 	actionGroup = append(actionGroup, keys.KeyEditor)
+	if m.instance.UpdateAvailable() {
+		actionGroup = append(actionGroup, keys.KeyUpdate)
+	}
 
 	// Navigation group
 	var navigationGroup []keys.KeyName

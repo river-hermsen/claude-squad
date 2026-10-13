@@ -21,6 +21,10 @@ type ConfirmationOverlay struct {
 	ConfirmKey string
 	// Custom cancel key (defaults to 'n')
 	CancelKey string
+	// altKey, if set, picks a second action, onAlt, which altLabel describes; see SetAlt.
+	altKey   string
+	altLabel string
+	onAlt    func()
 	// Custom styling options
 	borderColor lipgloss.Color
 }
@@ -40,6 +44,13 @@ func NewConfirmationOverlay(message string) *ConfirmationOverlay {
 // HandleKeyPress processes a key press and updates the state
 // Returns true if the overlay should be closed
 func (c *ConfirmationOverlay) HandleKeyPress(msg tea.KeyMsg) bool {
+	if c.altKey != "" && msg.String() == c.altKey {
+		c.Dismissed = true
+		if c.onAlt != nil {
+			c.onAlt()
+		}
+		return true
+	}
 	switch msg.String() {
 	case c.ConfirmKey:
 		c.Dismissed = true
@@ -69,8 +80,11 @@ func (c *ConfirmationOverlay) Render(opts ...WhitespaceOption) string {
 
 	// Add the confirmation instructions
 	content := c.message + "\n\n" +
-		"Press " + lipgloss.NewStyle().Bold(true).Render(c.ConfirmKey) + " to confirm, " +
-		lipgloss.NewStyle().Bold(true).Render(c.CancelKey) + " or " +
+		"Press " + lipgloss.NewStyle().Bold(true).Render(c.ConfirmKey) + " to confirm, "
+	if c.altKey != "" {
+		content += lipgloss.NewStyle().Bold(true).Render(c.altKey) + " to " + c.altLabel + ", "
+	}
+	content += lipgloss.NewStyle().Bold(true).Render(c.CancelKey) + " or " +
 		lipgloss.NewStyle().Bold(true).Render("esc") + " to cancel"
 
 	// Apply the border style and return
@@ -90,6 +104,12 @@ func (c *ConfirmationOverlay) SetBorderColor(color lipgloss.Color) {
 // SetConfirmKey sets the key used to confirm the action
 func (c *ConfirmationOverlay) SetConfirmKey(key string) {
 	c.ConfirmKey = key
+}
+
+// SetAlt offers a second action besides confirming: key runs onAlt, which label describes in
+// the instructions, as in "a to restart all 3".
+func (c *ConfirmationOverlay) SetAlt(key string, label string, onAlt func()) {
+	c.altKey, c.altLabel, c.onAlt = key, label, onAlt
 }
 
 // SetCancelKey sets the key used to cancel the action

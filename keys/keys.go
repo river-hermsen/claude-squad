@@ -51,6 +51,9 @@ const (
 	// KeyFolder is tab while a new session is being named: it picks the folder the session
 	// starts in.
 	KeyFolder
+	// KeyUpdate restarts the selected Claude session on the installed Claude Code, continuing
+	// its conversation.
+	KeyUpdate
 )
 
 // GlobalKeyStringsMap is a global, immutable map string to keybinding.
@@ -79,6 +82,7 @@ var GlobalKeyStringsMap = map[string]KeyName{
 	"C":          KeyResumeClaude,
 	"`":          KeyFocus,
 	"v":          KeyEditor,
+	"U":          KeyUpdate,
 }
 
 // GlobalkeyBindings is a global, immutable map of KeyName tot keybinding.
@@ -169,6 +173,10 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 	KeyEditor: key.NewBinding(
 		key.WithKeys("v"),
 		key.WithHelp("v", "vs code"),
+	),
+	KeyUpdate: key.NewBinding(
+		key.WithKeys("U"),
+		key.WithHelp("U", "update"),
 	),
 
 	// -- Special keybindings --

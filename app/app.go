@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -129,6 +130,9 @@ type home struct {
 	textOverlay *overlay.TextOverlay
 	// confirmationOverlay displays confirmation modals
 	confirmationOverlay *overlay.ConfirmationOverlay
+	// confirmed is a command a confirmation's callback leaves for Update to run once the
+	// modal closes.
+	confirmed tea.Cmd
 	// inputOverlay asks for a line of text in stateInput, which onInputSubmit then gets.
 	inputOverlay  *overlay.InputOverlay
 	onInputSubmit func(value string) tea.Cmd
@@ -298,8 +302,9 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmds []tea.Cmd
 		save := false
 		for _, r := range msg.results {
-			// Skip instances that were paused while metadata was being computed
-			if r.instance.Status == session.Paused {
+			// Skip instances that were paused or stopped for a restart while metadata was being
+			// computed
+			if r.instance.Status == session.Paused || r.instance.Restarting() {
 				continue
 			}
 			if r.ended {
@@ -316,6 +321,7 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// A restart continues this conversation, even after cs itself restarts.
 				save = true
 			}
+			r.instance.SetInstalledClaudeVersion(r.installedClaude)
 			if r.updated {
 				r.instance.SetStatus(session.Running)
 			} else if r.hasPrompt {
@@ -408,6 +414,19 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case instanceChangedMsg:
 		// Handle instance changed after confirmation action
 		return m, m.instanceChanged()
+	case restartReadyMsg:
+		// A session killed meanwhile stays gone.
+		if !slices.Contains(m.list.GetInstances(), msg.instance) {
+			return m, nil
+		}
+		var cmd tea.Cmd
+		if err := msg.instance.FinishRestart(); err != nil {
+			cmd = m.handleError(err)
+		}
+		if err := m.storage.SaveInstances(m.list.GetInstances()); err != nil {
+			log.ErrorLog.Printf("could not save instances: %v", err)
+		}
+		return m, tea.Batch(cmd, tea.WindowSize(), m.instanceChanged())
 	case editorOpenedMsg:
 		return m, m.showInfo("Opened " + msg.dir + " in VS Code")
 	case instanceStartedMsg:
@@ -705,7 +724,9 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		if shouldClose {
 			m.state = stateDefault
 			m.confirmationOverlay = nil
-			return m, nil
+			cmd := m.confirmed
+			m.confirmed = nil
+			return m, cmd
 		}
 		return m, nil
 	}
@@ -908,6 +929,22 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			return m, nil
 		}
 		return m, m.openEditor(selected)
+	case keys.KeyUpdate:
+		selected := m.list.GetSelectedInstance()
+		if selected == nil || !selected.Started() || selected.Status == session.Loading {
+			return m, nil
+		}
+		if !selected.IsClaude() {
+			return m, m.handleError(fmt.Errorf("only Claude Code sessions can be updated"))
+		}
+		if selected.Paused() {
+			// Resuming starts the installed Claude Code too.
+			if err := selected.Resume(); err != nil {
+				return m, m.handleError(err)
+			}
+			return m, tea.WindowSize()
+		}
+		return m, m.confirmUpdate(selected)
 	case keys.KeyResume:
 		selected := m.list.GetSelectedInstance()
 		if selected == nil || selected.Status == session.Loading {
@@ -1239,6 +1276,8 @@ type instanceMetaResult struct {
 	claudeInfo *claudestatus.Info
 	// claudeProcess is Claude Code's registry entry of the process in the instance's pane.
 	claudeProcess *claudestatus.Process
+	// installedClaude is the version of Claude Code the instance's program starts now.
+	installedClaude string
 	// ended is true if the instance's tmux session is gone.
 	ended bool
 }
@@ -1248,6 +1287,12 @@ type metadataUpdateDoneMsg struct {
 	results []instanceMetaResult
 	// limits are the account's usage limits Claude Code reported last, or nil.
 	limits *claudestatus.Limits
+}
+
+// restartReadyMsg is sent when the Claude Code process of an instance stopped for a restart
+// has exited; see restartInstances.
+type restartReadyMsg struct {
+	instance *session.Instance
 }
 
 // instanceStartDoneMsg is sent when the background instance start completes.
@@ -1271,7 +1316,7 @@ func runInstanceStartCmd(instance *session.Instance) tea.Cmd {
 func (m *home) snapshotActiveInstances() []*session.Instance {
 	var out []*session.Instance
 	for _, inst := range m.list.GetInstances() {
-		if inst.Started() && !inst.Paused() {
+		if inst.Started() && !inst.Paused() && !inst.Restarting() {
 			out = append(out, inst)
 		}
 	}
@@ -1313,6 +1358,9 @@ func tickUpdateMetadataCmd(active []*session.Instance, selected *session.Instanc
 				}
 				r.claudeInfo = instance.ComputeClaudeInfo()
 				r.claudeProcess = instance.ComputeClaudeProcess()
+				if instance.IsClaude() {
+					r.installedClaude = claudestatus.InstalledVersion(instance.Program)
+				}
 			}(idx, inst)
 		}
 		wg.Wait()
@@ -1393,6 +1441,66 @@ func (m *home) cancelPromptOverlay() tea.Cmd {
 			return nil
 		},
 	)
+}
+
+// confirmUpdate asks whether to restart inst on the installed Claude Code, warning about what
+// that cuts short. With several idle sessions running an older Claude Code, it also offers to
+// restart all of those.
+func (m *home) confirmUpdate(inst *session.Instance) tea.Cmd {
+	version := "the installed Claude Code"
+	if v := inst.InstalledClaudeVersion(); v != "" {
+		version = "Claude Code " + v
+	}
+	message := fmt.Sprintf("Restart '%s' on %s? It continues its conversation.", inst.Title, version)
+	for _, warning := range inst.RestartWarnings() {
+		message += "\n[!] " + warning
+	}
+	m.confirmAction(message, nil)
+	m.confirmationOverlay.SetWidth(60)
+	m.confirmationOverlay.OnConfirm = func() {
+		m.state = stateDefault
+		m.confirmed = m.restartInstances([]*session.Instance{inst})
+	}
+	if idle := m.idleOutdated(); len(idle) > 1 {
+		label := fmt.Sprintf("restart all %d idle sessions with an update", len(idle))
+		m.confirmationOverlay.SetAlt("a", label, func() {
+			m.state = stateDefault
+			m.confirmed = m.restartInstances(idle)
+		})
+	}
+	return nil
+}
+
+// idleOutdated returns the sessions running an older Claude Code than the installed one that a
+// restart would cut nothing short in.
+func (m *home) idleOutdated() []*session.Instance {
+	var out []*session.Instance
+	for _, inst := range m.list.GetInstances() {
+		if inst.Started() && !inst.Paused() && inst.Status != session.Loading &&
+			inst.UpdateAvailable() && len(inst.RestartWarnings()) == 0 {
+			out = append(out, inst)
+		}
+	}
+	return out
+}
+
+// restartInstances restarts insts on the installed Claude Code, each continuing its
+// conversation: it stops them now, and restarts each once its old process has exited (see
+// restartReadyMsg).
+func (m *home) restartInstances(insts []*session.Instance) tea.Cmd {
+	var cmds []tea.Cmd
+	for _, inst := range insts {
+		wait, err := inst.StopForRestart()
+		if err != nil {
+			cmds = append(cmds, m.handleError(err))
+			continue
+		}
+		cmds = append(cmds, func() tea.Msg {
+			wait()
+			return restartReadyMsg{instance: inst}
+		})
+	}
+	return tea.Batch(append(cmds, m.instanceChanged())...)
 }
 
 // confirmAction shows a confirmation modal and stores the action to execute on confirm

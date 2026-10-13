@@ -54,6 +54,7 @@ func (h helpTypeGeneral) toContent() string {
 		keyStyle.Render("v")+descStyle.Render("         - Open the session's worktree in VS Code"),
 		keyStyle.Render("ctrl-q")+descStyle.Render("    - Detach from session"),
 		keyStyle.Render("r")+descStyle.Render("         - Resume a paused session (its program had exited); a Claude session continues its conversation"),
+		keyStyle.Render("U")+descStyle.Render("         - Update: restart a Claude session on the installed Claude Code, continuing its conversation (⬆ marks older ones)"),
 		"",
 		headerStyle.Render("Other:"),
 		keyStyle.Render("tab")+descStyle.Render("       - Switch between preview, diff, and terminal tabs"),

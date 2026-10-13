@@ -238,6 +238,11 @@ func readInfo(path string) *Info {
 type Process struct {
 	// SessionID is the id of the conversation the process runs, which `--resume` takes.
 	SessionID string `json:"sessionId"`
+	// Version is the version of Claude Code the process runs, such as "2.1.296".
+	Version string `json:"version"`
+	// Status is what the process does: "idle" while it waits for a prompt, "busy" while it
+	// works on one, "shell" while it waits with shell commands running in the background.
+	Status string `json:"status"`
 }
 
 // ReadProcess returns the registry entry of the Claude Code process pid, or nil if there is

@@ -313,9 +313,21 @@ func plainDiffCounts(added, removed int, base lipgloss.Style) string {
 	return base.Render(fmt.Sprintf("+%d,-%d ", added, removed))
 }
 
+// warnColor is amber, for a detail that needs attention soon.
+var warnColor = lipgloss.Color("#c08400")
+
 // agentSegments describes the agent: the model, context use and effort Claude Code last
-// reported, or else the program's name.
+// reported, or else the program's name. A session running an older Claude Code than the
+// installed one says so, as U restarts it on the new one.
 func agentSegments(i *session.Instance) []segment {
+	segments := describeAgent(i)
+	if i.UpdateAvailable() {
+		segments = append(segments, segment{text: "⬆ update", color: warnColor})
+	}
+	return segments
+}
+
+func describeAgent(i *session.Instance) []segment {
 	info := i.GetClaudeInfo()
 	if info == nil || info.Model == "" {
 		fields := strings.Fields(i.Program)
@@ -363,7 +375,7 @@ func contextColor(used, size int) lipgloss.TerminalColor {
 	case left < 0.2:
 		return removedLinesStyle.GetForeground()
 	case left < 0.5:
-		return lipgloss.Color("#c08400")
+		return warnColor
 	default:
 		return nil
 	}

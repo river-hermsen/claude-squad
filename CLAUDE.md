@@ -59,6 +59,11 @@ All git isolation goes through a `Workspace` in `~/.claude-squad/workspaces/<bra
 - **`Resume`** (`r`): recreates only the worktrees that are missing or invalid (so it doesn't discard uncommitted work), then restores or restarts tmux. Instances checked out by older builds get their worktrees back from their branches this way.
   - A restart (the tmux session had ended) of a Claude instance continues the conversation last seen in its pane: `--resume <InstanceData.ClaudeSessionID>`, if Claude Code saved it (`claudestatus.HasTranscript`, which needs one message). The metadata tick reads that id from Claude Code's registry `~/.claude/sessions/<pid>.json` (`ComputeClaudeProcess` → `SetClaudeProcess`) and saves it when it changes.
   - If the session then ends within 15 s (`MarkEnded`), the conversation could not be continued: the id is dropped and the next `r` starts afresh.
+- **Update** (`U`, Claude only, `session/claude_update.go`): restarts a running session on the installed Claude Code, continuing its conversation. Claude Code updates itself on disk, but a running process keeps its version.
+  - The registry entry also gives the process's `version` and `status` (`idle`, `busy`, or `shell` when background shells run). `claudestatus.InstalledVersion` takes the installed version from the native installer's symlink target (`versions/<version>`), else from `claude --version`, cached per binary. An older session gets `⬆ update` in the list and `U` in the menu.
+  - `StopForRestart` (main thread) closes tmux and leaves the instance `Loading` and `Restarting`, which the metadata tick skips. A Cmd waits for the old pid to exit (about 1.25 s), then `restartReadyMsg` → `FinishRestart` → `restart()` with `--resume`.
+  - Killing tmux under Claude, whether idle, busy, or with background shells, leaves no background session, and `--resume` continues the conversation (verified on 2.1.296).
+  - The confirmation lists `RestartWarnings`: Claude busy, background shells, a non-empty prompt. With at least two outdated sessions that are idle with an empty prompt, `a` restarts all of them. On a paused session `U` resumes it.
 - **`Kill`**: closes tmux, then removes the worktrees, their branches (unless pre-existing), the workspace directory and the Claude settings directory.
   - Claude Code can move a conversation to the background, for example from its agents view, where it outlives tmux. Resuming it elsewhere then fails with "is running in the background".
   - So Kill first reads the pane's conversation id (`paneSessionID`). `stopBackgroundConversation` then polls `claude agents --json` a few times in a goroutine and runs `claude stop <id>` on the matching background entry. It matches by id prefix, or by `--name` plus cwd when the id is unknown.
@@ -123,6 +128,7 @@ The list's info row shows `<model> · <context used>/<window> · <effort>` for C
 ### Event loop and concurrency (`app/app.go`)
 
 - `home.state` is a small state machine (`stateDefault`, `stateNew`, `statePrompt`, `stateHelp`, `stateConfirm`) that drives which overlay (`ui/overlay/`) and menu state are active.
+  - A confirmation's callbacks run synchronously and drop the action's message. A callback that needs a Cmd run (like `U`'s restarts) leaves it in `home.confirmed`, which `Update` returns when the modal closes. `ConfirmationOverlay.SetAlt` adds a second action key.
 - Expensive I/O stays off the Bubble Tea main loop:
   - `tickUpdateMetadataCmd` self-chains every 500ms. It checks every active instance in parallel goroutines (tmux pane hash for running vs ready, prompt detection, git diff). Only the selected instance gets a full diff; the others get `--numstat` counts to bound memory.
   - Results come back as `metadataUpdateDoneMsg` and are applied in `Update` on the main thread (`SetStatus`, `SetDiffStats`). Never mutate `Instance` state from the background goroutine.
@@ -153,7 +159,7 @@ Both detect screens by literal UI strings. Support for a new agent, or a fix aft
 
 ### Keybindings
 
-`keys/keys.go` is the source of truth (`GlobalKeyStringsMap` + `GlobalkeyBindings`). This fork removed upstream's push key (`p`), along with all `gh` usage, and checkout (`c`); pushing and checking out are left to the user or the agent. It added `R` (rename), `f` (fork), `` ` `` (type into the session), `v` (open `Instance.EditorDir()` in VS Code: `open -a`, which also brings it to the front, on macOS, else `code`; `EditorDir` counts the worktree directories on disk, since an agent may add one itself) and `tab` while naming (folder picker).
+`keys/keys.go` is the source of truth (`GlobalKeyStringsMap` + `GlobalkeyBindings`). This fork removed upstream's push key (`p`), along with all `gh` usage, and checkout (`c`); pushing and checking out are left to the user or the agent. It added `R` (rename), `f` (fork), `` ` `` (type into the session), `v` (open `Instance.EditorDir()` in VS Code: `open -a`, which also brings it to the front, on macOS, else `code`; `EditorDir` counts the worktree directories on disk, since an agent may add one itself), `U` (update; see the instance lifecycle) and `tab` while naming (folder picker).
 
 - The bottom menu drops the descriptions outside the highlighted group when it is wider than the terminal (`Menu.renderOptions`). `J/K reorder` shows only in the Preview tab.
 
