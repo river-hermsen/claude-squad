@@ -49,7 +49,7 @@ func (h helpTypeGeneral) toContent() string {
 		keyStyle.Render("D")+descStyle.Render("         - Kill (delete) the selected session"),
 		keyStyle.Render("↑/k, ↓/j")+descStyle.Render("  - Navigate between sessions"),
 		keyStyle.Render("K/J")+descStyle.Render("       - Move the selected session up/down in the list"),
-		keyStyle.Render("→ or `")+descStyle.Render("    - Type into the selected session from here; ` stops"),
+		keyStyle.Render("→, ` or §")+descStyle.Render(" - Type into the selected session from here; ` or § stops"),
 		keyStyle.Render("↵/o")+descStyle.Render("       - Attach to the selected session"),
 		keyStyle.Render("v")+descStyle.Render("         - Open the session's worktree in VS Code"),
 		keyStyle.Render("ctrl-q")+descStyle.Render("    - Detach from session"),

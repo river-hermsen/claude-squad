@@ -81,6 +81,7 @@ var GlobalKeyStringsMap = map[string]KeyName{
 	"f":          KeyFork,
 	"C":          KeyResumeClaude,
 	"`":          KeyFocus,
+	"§":          KeyFocus, // the key left of 1 on a Mac's ISO keyboard
 	"v":          KeyEditor,
 	"U":          KeyUpdate,
 }
@@ -167,8 +168,8 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 		key.WithHelp("C", "resume claude"),
 	),
 	KeyFocus: key.NewBinding(
-		key.WithKeys("`"),
-		key.WithHelp("`", "type"),
+		key.WithKeys("`", "§"),
+		key.WithHelp("`/§", "type"),
 	),
 	KeyEditor: key.NewBinding(
 		key.WithKeys("v"),
@@ -182,8 +183,8 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 	// -- Special keybindings --
 
 	KeyFocusExit: key.NewBinding(
-		key.WithKeys("`"),
-		key.WithHelp("`", "back to list"),
+		key.WithKeys("`", "§"),
+		key.WithHelp("`/§", "back to list"),
 	),
 
 	KeySubmitName: key.NewBinding(
@@ -193,7 +194,7 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 
 	KeyFocusRight: key.NewBinding(
 		key.WithKeys("right"),
-		key.WithHelp("→/`", "type"),
+		key.WithHelp("→/`/§", "type"),
 	),
 
 	KeyFolder: key.NewBinding(

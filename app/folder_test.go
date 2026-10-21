@@ -109,7 +109,7 @@ func TestResumeConversationPicksFolder(t *testing.T) {
 	require.Equal(t, launchDir, m.list.GetInstances()[1].Path, "the launch directory comes first")
 }
 
-// → in the list types into the selected session, as ` does; ` stops.
+// → in the list types into the selected session, as ` and § do; either stops.
 func TestRightArrowStartsTyping(t *testing.T) {
 	m := newTestHome(t)
 	inst, err := session.FromInstanceData(session.InstanceData{Title: "typing", Path: t.TempDir(), Program: "claude", Status: session.Paused})
@@ -127,5 +127,10 @@ func TestRightArrowStartsTyping(t *testing.T) {
 	require.Contains(t, m.View(), "typing into typing")
 
 	press(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("`")})
+	require.Equal(t, stateDefault, m.state)
+
+	press(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("§")})
+	require.Equal(t, stateFocus, m.state)
+	press(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("§")})
 	require.Equal(t, stateDefault, m.state)
 }

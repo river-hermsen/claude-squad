@@ -44,7 +44,7 @@ func TestMenuDropsDescriptionsWhenTooWide(t *testing.T) {
 	require.Contains(t, m.String(), "v vs code")
 
 	m.SetSize(100, 1)
-	require.Contains(t, m.String(), "n • C • D • R • f │ ↵/o open • →/` type • v vs code │ tab • J/K │ ? • q")
+	require.Contains(t, m.String(), "n • C • D • R • f │ ↵/o open • →/`/§ type • v vs code │ tab • J/K │ ? • q")
 }
 
 // A session on an older Claude Code than the installed one offers to update it.

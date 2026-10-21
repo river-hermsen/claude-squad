@@ -159,11 +159,11 @@ Both detect screens by literal UI strings. Support for a new agent, or a fix aft
 
 ### Keybindings
 
-`keys/keys.go` is the source of truth (`GlobalKeyStringsMap` + `GlobalkeyBindings`). This fork removed upstream's push key (`p`), along with all `gh` usage, and checkout (`c`); pushing and checking out are left to the user or the agent. It added `R` (rename), `f` (fork), `` ` `` (type into the session), `v` (open `Instance.EditorDir()` in VS Code: `open -a`, which also brings it to the front, on macOS, else `code`; `EditorDir` counts the worktree directories on disk, since an agent may add one itself), `U` (update; see the instance lifecycle) and `tab` while naming (folder picker).
+`keys/keys.go` is the source of truth (`GlobalKeyStringsMap` + `GlobalkeyBindings`). This fork removed upstream's push key (`p`), along with all `gh` usage, and checkout (`c`); pushing and checking out are left to the user or the agent. It added `R` (rename), `f` (fork), `` ` `` or `§` (type into the session; `§` is the key left of 1 on a Mac's ISO keyboard), `v` (open `Instance.EditorDir()` in VS Code: `open -a`, which also brings it to the front, on macOS, else `code`; `EditorDir` counts the worktree directories on disk, since an agent may add one itself), `U` (update; see the instance lifecycle) and `tab` while naming (folder picker).
 
 - The bottom menu drops the descriptions outside the highlighted group when it is wider than the terminal (`Menu.renderOptions`). `J/K reorder` shows only in the Preview tab.
 
-- **Typing mode** (`stateFocus`): `` ` `` or `→` (`KeyFocusRight`; in the Diff tab of a session with several changed repos `←/→` switch repos instead, `ui.ArrowsSwitchRepos`) switches to the Preview tab. While typing, the selected list row is drawn in `focusColor` with its colored details plain (`List.SetTyping`). `handleKeyPress` then sends every key except `` ` `` to the selected session.
+- **Typing mode** (`stateFocus`): `` ` ``, `§` or `→` (`KeyFocusRight`; in the Diff tab of a session with several changed repos `←/→` switch repos instead, `ui.ArrowsSwitchRepos`) switches to the Preview tab. While typing, the selected list row is drawn in `focusColor` with its colored details plain (`List.SetTyping`). `handleKeyPress` then sends every key except `` ` `` and `§` to the selected session.
   - `keyBytes` turns a key back into terminal bytes. Pastes keep their bracketed-paste markers.
   - `Instance.SendKeys` writes those bytes to the tmux client PTY that cs keeps attached.
   - `View` derives the orange window border (`TabbedWindow.SetFocused`) and the menu (`Menu.SetFocusMode`) from `m.state`. Any state change, such as a help screen popping up, therefore ends typing mode cleanly.
